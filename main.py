@@ -26,6 +26,7 @@ recordings = {}
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 TikTok Live Recorder\n\n"
+        "Comandos:\n\n"
         "/gravar usuario - iniciar gravação\n"
         "/parar - parar gravação\n"
         "/status - verificar status"
@@ -33,6 +34,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     if not recordings:
         await update.message.reply_text(
             "🟢 Nenhuma gravação ativa."
@@ -49,14 +51,179 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def record_live(username, chat_id):
+async def finalizar_arquivo(
+    username,
+    output_dir,
+    chat_id
+):
 
-    output_dir = Path("/tmp/recordings")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
 
-    filename = output_dir / f"{username}.%(ext)s"
+        # Procura arquivos da gravação
+        files = list(
+            output_dir.glob(
+                f"{username}.*"
+            )
+        )
 
-    url = f"https://www.tiktok.com/@{username}/live"
+        files = [
+            f for f in files
+            if f.is_file()
+        ]
+
+        # Procura arquivo .part
+        part_files = [
+            f for f in files
+            if f.name.endswith(".part")
+        ]
+
+        if part_files:
+
+            part_file = part_files[0]
+
+            final_file = (
+                output_dir /
+                f"{username}.mp4"
+            )
+
+            logging.info(
+                "Arquivo parcial encontrado: %s",
+                part_file
+            )
+
+            logging.info(
+                "Finalizando arquivo com FFmpeg..."
+            )
+
+            # Converte o MPEG-TS parcial para MP4
+            ffmpeg = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(part_file),
+                "-c",
+                "copy",
+                "-bsf:a",
+                "aac_adtstoasc",
+                str(final_file),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            stdout, stderr = await ffmpeg.communicate()
+
+            if ffmpeg.returncode == 0:
+
+                logging.info(
+                    "Arquivo finalizado: %s",
+                    final_file
+                )
+
+                try:
+                    part_file.unlink()
+                except Exception:
+                    pass
+
+            else:
+
+                logging.error(
+                    "FFmpeg não conseguiu finalizar o arquivo."
+                )
+
+                logging.error(
+                    stderr.decode(
+                        "utf-8",
+                        errors="ignore"
+                    )
+                )
+
+        # Procura novamente o arquivo final
+        final_files = list(
+            output_dir.glob(
+                f"{username}.*"
+            )
+        )
+
+        final_files = [
+            f for f in final_files
+            if f.is_file()
+            and not f.name.endswith(".part")
+        ]
+
+        if final_files:
+
+            final_file = max(
+                final_files,
+                key=lambda f: f.stat().st_mtime
+            )
+
+            size = (
+                final_file.stat().st_size
+                / (1024 * 1024)
+            )
+
+            await telegram_app.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "✅ Gravação finalizada!\n\n"
+                    f"👤 @{username}\n"
+                    f"📁 {final_file.name}\n"
+                    f"📦 {size:.1f} MB"
+                )
+            )
+
+            return final_file
+
+        await telegram_app.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⚠️ Não foi possível encontrar "
+                f"o arquivo de @{username}."
+            )
+        )
+
+        return None
+
+    except Exception as e:
+
+        logging.exception(
+            "Erro ao finalizar arquivo"
+        )
+
+        await telegram_app.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"❌ Erro ao finalizar "
+                f"@{username}:\n\n{e}"
+            )
+        )
+
+        return None
+
+
+async def record_live(
+    username,
+    chat_id
+):
+
+    output_dir = Path(
+        "/tmp/recordings"
+    )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    filename = (
+        output_dir /
+        f"{username}.%(ext)s"
+    )
+
+    url = (
+        f"https://www.tiktok.com/"
+        f"@{username}/live"
+    )
 
     process = None
 
@@ -64,38 +231,52 @@ async def record_live(username, chat_id):
 
         await telegram_app.bot.send_message(
             chat_id=chat_id,
-            text=f"🔎 Procurando a live de @{username}..."
+            text=(
+                f"🔎 Procurando a live de "
+                f"@{username}..."
+            )
         )
 
         command = [
             "yt-dlp",
+
             "--newline",
+
             "--no-warnings",
+
             "-f",
             "best",
+
+            "--no-part",
+
             "-o",
             str(filename),
+
             url
         ]
 
         logging.info(
-            "Iniciando gravação: %s",
+            "Comando: %s",
             " ".join(command)
         )
 
-        # Cria um grupo de processos.
-        # Assim conseguimos encerrar yt-dlp + FFmpeg juntos.
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True
+        process = (
+            await asyncio.create_subprocess_exec(
+                *command,
+
+                stdout=asyncio.subprocess.PIPE,
+
+                stderr=asyncio.subprocess.STDOUT,
+
+                start_new_session=True
+            )
         )
 
         recordings[username] = {
             "process": process,
             "file": str(filename),
-            "stopping": False
+            "stopping": False,
+            "chat_id": chat_id
         }
 
         await telegram_app.bot.send_message(
@@ -106,6 +287,7 @@ async def record_live(username, chat_id):
             )
         )
 
+        # Lê os logs enquanto grava
         while True:
 
             line = await process.stdout.readline()
@@ -125,79 +307,52 @@ async def record_live(username, chat_id):
                     text
                 )
 
-        return_code = await process.wait()
+        await process.wait()
 
-        data = recordings.pop(username, None)
-
-        # Procura o arquivo final.
-        files = list(
-            output_dir.glob(
-                f"{username}.*"
-            )
+        data = recordings.get(
+            username
         )
 
-        # Ignora arquivos .part
-        files = [
-            f for f in files
-            if not f.name.endswith(".part")
-        ]
+        stopping = False
 
-        if files:
-
-            file_path = max(
-                files,
-                key=lambda f: f.stat().st_mtime
+        if data:
+            stopping = data.get(
+                "stopping",
+                False
             )
 
-            size = file_path.stat().st_size / (
-                1024 * 1024
-            )
+        recordings.pop(
+            username,
+            None
+        )
 
-            if data and data.get("stopping"):
-
-                await telegram_app.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"⏹️ Gravação parada!\n\n"
-                        f"👤 @{username}\n"
-                        f"📦 Tamanho: {size:.1f} MB"
-                    )
-                )
-
-            else:
-
-                await telegram_app.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"✅ Gravação finalizada!\n\n"
-                        f"👤 @{username}\n"
-                        f"📦 Tamanho: {size:.1f} MB"
-                    )
-                )
-
-        else:
-
-            await telegram_app.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"⚠️ Gravação de @{username} "
-                    f"terminou, mas o arquivo não foi encontrado."
-                )
-            )
+        # Finaliza o arquivo
+        await finalizar_arquivo(
+            username,
+            output_dir,
+            chat_id
+        )
 
     except asyncio.CancelledError:
 
-        if process and process.returncode is None:
+        if process:
 
             try:
-                os.killpg(
-                    process.pid,
-                    signal.SIGKILL
-                )
+
+                if process.returncode is None:
+
+                    os.killpg(
+                        process.pid,
+                        signal.SIGKILL
+                    )
+
             except Exception:
                 pass
 
-        recordings.pop(username, None)
+        recordings.pop(
+            username,
+            None
+        )
 
         raise
 
@@ -215,8 +370,8 @@ async def record_live(username, chat_id):
         await telegram_app.bot.send_message(
             chat_id=chat_id,
             text=(
-                f"❌ Erro ao gravar @{username}:\n\n"
-                f"{e}"
+                f"❌ Erro ao gravar "
+                f"@{username}:\n\n{e}"
             )
         )
 
@@ -245,7 +400,8 @@ async def gravar(
     if username in recordings:
 
         await update.message.reply_text(
-            f"⚠️ @{username} já está sendo gravado."
+            f"⚠️ @{username} "
+            f"já está sendo gravado."
         )
 
         return
@@ -270,19 +426,15 @@ async def parar(
     if not recordings:
 
         await update.message.reply_text(
-            "🟢 Não existe nenhuma gravação ativa."
+            "🟢 Não existe nenhuma "
+            "gravação ativa."
         )
 
         return
 
-    usernames = list(recordings.keys())
-
-    for username in usernames:
-
-        data = recordings.get(username)
-
-        if not data:
-            continue
+    for username, data in list(
+        recordings.items()
+    ):
 
         process = data["process"]
 
@@ -290,23 +442,25 @@ async def parar(
 
         if process.returncode is None:
 
+            await update.message.reply_text(
+                f"⏹️ Parando @{username}..."
+            )
+
             try:
 
-                # Mata yt-dlp + FFmpeg.
+                # Primeiro tenta encerramento normal.
                 os.killpg(
                     process.pid,
-                    signal.SIGTERM
+                    signal.SIGINT
                 )
 
-                await update.message.reply_text(
-                    f"⏹️ Parando @{username}..."
-                )
-
-                # Dá alguns segundos para finalizar.
+                # Espera até 15 segundos
+                # para o FFmpeg finalizar.
                 try:
+
                     await asyncio.wait_for(
                         process.wait(),
-                        timeout=10
+                        timeout=15
                     )
 
                 except asyncio.TimeoutError:
@@ -317,10 +471,12 @@ async def parar(
                     )
 
                     try:
+
                         os.killpg(
                             process.pid,
                             signal.SIGKILL
                         )
+
                     except Exception:
                         pass
 
@@ -331,24 +487,37 @@ async def parar(
                 )
 
                 await update.message.reply_text(
-                    f"❌ Erro ao parar @{username}: {e}"
+                    f"❌ Erro ao parar "
+                    f"@{username}:\n{e}"
                 )
 
 
 telegram_app.add_handler(
-    CommandHandler("start", start)
+    CommandHandler(
+        "start",
+        start
+    )
 )
 
 telegram_app.add_handler(
-    CommandHandler("status", status)
+    CommandHandler(
+        "status",
+        status
+    )
 )
 
 telegram_app.add_handler(
-    CommandHandler("gravar", gravar)
+    CommandHandler(
+        "gravar",
+        gravar
+    )
 )
 
 telegram_app.add_handler(
-    CommandHandler("parar", parar)
+    CommandHandler(
+        "parar",
+        parar
+    )
 )
 
 
@@ -386,10 +555,12 @@ async def shutdown():
         if process.returncode is None:
 
             try:
+
                 os.killpg(
                     process.pid,
                     signal.SIGKILL
                 )
+
             except Exception:
                 pass
 
