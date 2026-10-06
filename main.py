@@ -59,7 +59,6 @@ async def finalizar_arquivo(
 
     try:
 
-        # Procura arquivos da gravação
         files = list(
             output_dir.glob(
                 f"{username}.*"
@@ -71,7 +70,6 @@ async def finalizar_arquivo(
             if f.is_file()
         ]
 
-        # Procura arquivo .part
         part_files = [
             f for f in files
             if f.name.endswith(".part")
@@ -87,15 +85,9 @@ async def finalizar_arquivo(
             )
 
             logging.info(
-                "Arquivo parcial encontrado: %s",
-                part_file
+                "Finalizando arquivo parcial..."
             )
 
-            logging.info(
-                "Finalizando arquivo com FFmpeg..."
-            )
-
-            # Converte o MPEG-TS parcial para MP4
             ffmpeg = await asyncio.create_subprocess_exec(
                 "ffmpeg",
                 "-y",
@@ -114,11 +106,6 @@ async def finalizar_arquivo(
 
             if ffmpeg.returncode == 0:
 
-                logging.info(
-                    "Arquivo finalizado: %s",
-                    final_file
-                )
-
                 try:
                     part_file.unlink()
                 except Exception:
@@ -127,17 +114,12 @@ async def finalizar_arquivo(
             else:
 
                 logging.error(
-                    "FFmpeg não conseguiu finalizar o arquivo."
-                )
-
-                logging.error(
                     stderr.decode(
                         "utf-8",
                         errors="ignore"
                     )
                 )
 
-        # Procura novamente o arquivo final
         final_files = list(
             output_dir.glob(
                 f"{username}.*"
@@ -150,55 +132,94 @@ async def finalizar_arquivo(
             and not f.name.endswith(".part")
         ]
 
-        if final_files:
-
-            final_file = max(
-                final_files,
-                key=lambda f: f.stat().st_mtime
-            )
-
-            size = (
-                final_file.stat().st_size
-                / (1024 * 1024)
-            )
+        if not final_files:
 
             await telegram_app.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    "✅ Gravação finalizada!\n\n"
-                    f"👤 @{username}\n"
-                    f"📁 {final_file.name}\n"
-                    f"📦 {size:.1f} MB"
+                    f"⚠️ A gravação de @{username} "
+                    f"terminou, mas o arquivo não foi encontrado."
                 )
             )
 
-            return final_file
+            return
+
+        final_file = max(
+            final_files,
+            key=lambda f: f.stat().st_mtime
+        )
+
+        size = (
+            final_file.stat().st_size
+            / (1024 * 1024)
+        )
 
         await telegram_app.bot.send_message(
             chat_id=chat_id,
             text=(
-                f"⚠️ Não foi possível encontrar "
-                f"o arquivo de @{username}."
+                "✅ Gravação finalizada!\n\n"
+                f"👤 @{username}\n"
+                f"📦 Tamanho: {size:.1f} MB\n"
+                "📤 Enviando vídeo..."
             )
         )
 
-        return None
+        # Envia o vídeo para o Telegram
+        with open(
+            final_file,
+            "rb"
+        ) as video:
+
+            await telegram_app.bot.send_video(
+                chat_id=chat_id,
+                video=video,
+                caption=(
+                    f"🎥 @{username}\n"
+                    f"📦 {size:.1f} MB"
+                ),
+                supports_streaming=True
+            )
+
+        logging.info(
+            "Vídeo enviado para o Telegram: %s",
+            final_file
+        )
+
+        # Apaga o arquivo do Render depois do envio
+        try:
+
+            final_file.unlink()
+
+            logging.info(
+                "Arquivo removido do Render."
+            )
+
+        except Exception as e:
+
+            logging.warning(
+                "Não foi possível apagar arquivo: %s",
+                e
+            )
+
+        await telegram_app.bot.send_message(
+            chat_id=chat_id,
+            text="🗑️ Arquivo removido do armazenamento temporário."
+
+        )
 
     except Exception as e:
 
         logging.exception(
-            "Erro ao finalizar arquivo"
+            "Erro ao finalizar/enviar arquivo"
         )
 
         await telegram_app.bot.send_message(
             chat_id=chat_id,
             text=(
-                f"❌ Erro ao finalizar "
-                f"@{username}:\n\n{e}"
+                f"❌ Erro ao enviar o vídeo "
+                f"de @{username}:\n\n{e}"
             )
         )
-
-        return None
 
 
 async def record_live(
@@ -239,19 +260,13 @@ async def record_live(
 
         command = [
             "yt-dlp",
-
             "--newline",
-
             "--no-warnings",
-
             "-f",
             "best",
-
             "--no-part",
-
             "-o",
             str(filename),
-
             url
         ]
 
@@ -260,16 +275,11 @@ async def record_live(
             " ".join(command)
         )
 
-        process = (
-            await asyncio.create_subprocess_exec(
-                *command,
-
-                stdout=asyncio.subprocess.PIPE,
-
-                stderr=asyncio.subprocess.STDOUT,
-
-                start_new_session=True
-            )
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True
         )
 
         recordings[username] = {
@@ -287,7 +297,6 @@ async def record_live(
             )
         )
 
-        # Lê os logs enquanto grava
         while True:
 
             line = await process.stdout.readline()
@@ -301,6 +310,7 @@ async def record_live(
             ).strip()
 
             if text:
+
                 logging.info(
                     "[%s] %s",
                     username,
@@ -309,24 +319,11 @@ async def record_live(
 
         await process.wait()
 
-        data = recordings.get(
-            username
-        )
-
-        stopping = False
-
-        if data:
-            stopping = data.get(
-                "stopping",
-                False
-            )
-
         recordings.pop(
             username,
             None
         )
 
-        # Finaliza o arquivo
         await finalizar_arquivo(
             username,
             output_dir,
@@ -448,14 +445,11 @@ async def parar(
 
             try:
 
-                # Primeiro tenta encerramento normal.
                 os.killpg(
                     process.pid,
                     signal.SIGINT
                 )
 
-                # Espera até 15 segundos
-                # para o FFmpeg finalizar.
                 try:
 
                     await asyncio.wait_for(
@@ -466,8 +460,7 @@ async def parar(
                 except asyncio.TimeoutError:
 
                     logging.warning(
-                        "Processo não encerrou. "
-                        "Forçando encerramento."
+                        "Forçando encerramento..."
                     )
 
                     try:
