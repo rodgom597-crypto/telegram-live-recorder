@@ -3,6 +3,7 @@ import asyncio
 import logging
 import signal
 from pathlib import Path
+from datetime import datetime
 
 from fastapi import FastAPI, Request
 from telegram import Update
@@ -25,6 +26,8 @@ TOKEN = os.environ["BOT_TOKEN"]
 
 OUTPUT_DIR = Path("/tmp/recordings")
 
+RECONNECT_SECONDS = 10
+
 app = FastAPI()
 
 telegram_app = Application.builder().token(TOKEN).build()
@@ -33,7 +36,7 @@ recordings = {}
 
 
 # =========================================================
-# COMANDO /START
+# /START
 # =========================================================
 
 async def start(
@@ -51,7 +54,7 @@ async def start(
 
 
 # =========================================================
-# COMANDO /STATUS
+# /STATUS
 # =========================================================
 
 async def status(
@@ -67,37 +70,63 @@ async def status(
 
         return
 
-    lista = "\n".join(
-        f"🔴 @{username}"
-        for username in recordings
-    )
+    mensagens = []
+
+    for username, data in recordings.items():
+
+        tentativas = data.get(
+            "tentativas",
+            1
+        )
+
+        inicio = data.get(
+            "inicio"
+        )
+
+        if inicio:
+
+            segundos = int(
+                (datetime.now() - inicio).total_seconds()
+            )
+
+            horas = segundos // 3600
+            minutos = (segundos % 3600) // 60
+            segundos_restantes = segundos % 60
+
+            tempo = (
+                f"{horas:02d}:"
+                f"{minutos:02d}:"
+                f"{segundos_restantes:02d}"
+            )
+
+        else:
+
+            tempo = "00:00:00"
+
+        mensagens.append(
+            f"🔴 @{username}\n"
+            f"⏱️ Tempo: {tempo}\n"
+            f"🔄 Tentativas: {tentativas}"
+        )
 
     await update.message.reply_text(
-        f"📹 Gravações ativas:\n\n{lista}"
+        "📹 Gravações ativas:\n\n"
+        + "\n\n".join(mensagens)
     )
 
 
 # =========================================================
-# LOCALIZAR ARQUIVO FLV
+# PROCURAR ARQUIVOS DA GRAVAÇÃO
 # =========================================================
 
-def procurar_flv(username):
+def procurar_arquivos(username):
 
     if not OUTPUT_DIR.exists():
-        return None
+        return []
 
-    arquivos = list(
-        OUTPUT_DIR.iterdir()
-    )
+    arquivos = []
 
-    logging.info(
-        "Arquivos encontrados: %s",
-        [arquivo.name for arquivo in arquivos]
-    )
-
-    candidatos = []
-
-    for arquivo in arquivos:
+    for arquivo in OUTPUT_DIR.iterdir():
 
         if not arquivo.is_file():
             continue
@@ -121,231 +150,85 @@ def procurar_flv(username):
             tamanho = arquivo.stat().st_size
 
             if tamanho > 0:
-                candidatos.append(arquivo)
+                arquivos.append(arquivo)
 
         except Exception:
             pass
 
-    if not candidatos:
-        return None
-
-    return max(
-        candidatos,
+    return sorted(
+        arquivos,
         key=lambda arquivo: arquivo.stat().st_mtime
     )
 
 
 # =========================================================
-# CONVERTER FLV -> MP4
+# CONVERTER / JUNTAR FLV -> MP4
 # =========================================================
 
 async def converter_para_mp4(
-    flv_file,
+    arquivos,
     mp4_file
 ):
 
+    if not arquivos:
+        return False
+
     logging.info(
-        "Convertendo FLV para MP4..."
+        "Preparando %s arquivo(s) FLV.",
+        len(arquivos)
     )
 
     # -----------------------------------------------------
-    # PRIMEIRA TENTATIVA:
-    # Apenas troca o container.
-    # É muito mais rápido porque não recodifica.
+    # SE EXISTIR APENAS UM FLV
     # -----------------------------------------------------
 
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(flv_file),
-        "-c",
-        "copy",
-        "-bsf:a",
-        "aac_adtstoasc",
-        str(mp4_file)
-    ]
+    if len(arquivos) == 1:
 
-    logging.info(
-        "FFmpeg: %s",
-        " ".join(command)
-    )
-
-    processo = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-
-    stdout, stderr = await processo.communicate()
-
-    if processo.returncode == 0:
+        flv_file = arquivos[0]
 
         logging.info(
-            "Conversão para MP4 concluída."
-        )
-
-        return True
-
-    logging.warning(
-        "Conversão sem recodificação falhou."
-    )
-
-    logging.warning(
-        stderr.decode(
-            "utf-8",
-            errors="ignore"
-        )
-    )
-
-    # -----------------------------------------------------
-    # SEGUNDA TENTATIVA:
-    # Se o copy não funcionar, recodifica.
-    # -----------------------------------------------------
-
-    logging.info(
-        "Tentando conversão com recodificação..."
-    )
-
-    if mp4_file.exists():
-
-        try:
-            mp4_file.unlink()
-        except Exception:
-            pass
-
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(flv_file),
-
-        "-c:v",
-        "libx264",
-
-        "-preset",
-        "veryfast",
-
-        "-crf",
-        "23",
-
-        "-c:a",
-        "aac",
-
-        "-b:a",
-        "128k",
-
-        "-movflags",
-        "+faststart",
-
-        str(mp4_file)
-    ]
-
-    logging.info(
-        "FFmpeg recodificação: %s",
-        " ".join(command)
-    )
-
-    processo = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-
-    stdout, stderr = await processo.communicate()
-
-    if processo.returncode == 0:
-
-        logging.info(
-            "Recodificação concluída."
-        )
-
-        return True
-
-    logging.error(
-        "FFmpeg falhou definitivamente."
-    )
-
-    logging.error(
-        stderr.decode(
-            "utf-8",
-            errors="ignore"
-        )
-    )
-
-    return False
-
-
-# =========================================================
-# FINALIZAR GRAVAÇÃO
-# =========================================================
-
-async def finalizar_arquivo(
-    username,
-    chat_id
-):
-
-    try:
-
-        logging.info(
-            "Procurando FLV de @%s...",
-            username
-        )
-
-        # Dá alguns segundos para o arquivo terminar
-        await asyncio.sleep(3)
-
-        flv_file = procurar_flv(
-            username
-        )
-
-        if not flv_file:
-
-            logging.error(
-                "FLV não encontrado."
-            )
-
-            await telegram_app.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"⚠️ A gravação de @{username} "
-                    "terminou, mas o FLV não foi encontrado."
-                )
-            )
-
-            return
-
-        tamanho_flv = (
-            flv_file.stat().st_size
-            / (1024 * 1024)
-        )
-
-        logging.info(
-            "FLV encontrado: %s",
+            "Convertendo arquivo único: %s",
             flv_file
         )
 
-        await telegram_app.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "✅ Gravação finalizada!\n\n"
-                f"👤 @{username}\n"
-                f"📁 {flv_file.name}\n"
-                f"📦 {tamanho_flv:.1f} MB\n\n"
-                "🔄 Convertendo para MP4..."
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(flv_file),
+            "-c",
+            "copy",
+            "-bsf:a",
+            "aac_adtstoasc",
+            str(mp4_file)
+        ]
+
+        processo = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        stdout, stderr = await processo.communicate()
+
+        if processo.returncode == 0:
+            return True
+
+        logging.warning(
+            "Conversão copy falhou."
+        )
+
+        logging.warning(
+            stderr.decode(
+                "utf-8",
+                errors="ignore"
             )
         )
 
         # -------------------------------------------------
-        # NOME DO MP4
+        # TENTATIVA COM RECODIFICAÇÃO
         # -------------------------------------------------
 
-        mp4_file = (
-            OUTPUT_DIR /
-            f"{username}.mp4"
-        )
-
-        # Se existir algum MP4 antigo, remove
         if mp4_file.exists():
 
             try:
@@ -353,12 +236,303 @@ async def finalizar_arquivo(
             except Exception:
                 pass
 
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(flv_file),
+
+            "-c:v",
+            "libx264",
+
+            "-preset",
+            "veryfast",
+
+            "-crf",
+            "23",
+
+            "-c:a",
+            "aac",
+
+            "-b:a",
+            "128k",
+
+            "-movflags",
+            "+faststart",
+
+            str(mp4_file)
+        ]
+
+        processo = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        stdout, stderr = await processo.communicate()
+
+        if processo.returncode == 0:
+            return True
+
+        logging.error(
+            stderr.decode(
+                "utf-8",
+                errors="ignore"
+            )
+        )
+
+        return False
+
+    # =====================================================
+    # VÁRIOS FLV
+    # =====================================================
+
+    logging.info(
+        "Vários segmentos encontrados."
+    )
+
+    lista_file = (
+        OUTPUT_DIR /
+        "concat_list.txt"
+    )
+
+    try:
+
+        with open(
+            lista_file,
+            "w",
+            encoding="utf-8"
+        ) as arquivo_lista:
+
+            for arquivo in arquivos:
+
+                caminho = str(
+                    arquivo.resolve()
+                ).replace(
+                    "\\",
+                    "/"
+                )
+
+                caminho = caminho.replace(
+                    "'",
+                    "'\\''"
+                )
+
+                arquivo_lista.write(
+                    f"file '{caminho}'\n"
+                )
+
         # -------------------------------------------------
-        # CONVERTER
+        # TENTATIVA DE CONCATENAÇÃO SEM RECODIFICAR
         # -------------------------------------------------
 
+        command = [
+            "ffmpeg",
+            "-y",
+
+            "-f",
+            "concat",
+
+            "-safe",
+            "0",
+
+            "-i",
+            str(lista_file),
+
+            "-c",
+            "copy",
+
+            "-bsf:a",
+            "aac_adtstoasc",
+
+            str(mp4_file)
+        ]
+
+        logging.info(
+            "Juntando segmentos..."
+        )
+
+        processo = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        stdout, stderr = await processo.communicate()
+
+        if processo.returncode == 0:
+
+            logging.info(
+                "Segmentos unidos com sucesso."
+            )
+
+            try:
+                lista_file.unlink()
+            except Exception:
+                pass
+
+            return True
+
+        logging.warning(
+            "Concatenação sem recodificação falhou."
+        )
+
+        logging.warning(
+            stderr.decode(
+                "utf-8",
+                errors="ignore"
+            )
+        )
+
+        # -------------------------------------------------
+        # TENTATIVA COM RECODIFICAÇÃO
+        # -------------------------------------------------
+
+        if mp4_file.exists():
+
+            try:
+                mp4_file.unlink()
+            except Exception:
+                pass
+
+        command = [
+            "ffmpeg",
+            "-y",
+
+            "-f",
+            "concat",
+
+            "-safe",
+            "0",
+
+            "-i",
+            str(lista_file),
+
+            "-c:v",
+            "libx264",
+
+            "-preset",
+            "veryfast",
+
+            "-crf",
+            "23",
+
+            "-c:a",
+            "aac",
+
+            "-b:a",
+            "128k",
+
+            "-movflags",
+            "+faststart",
+
+            str(mp4_file)
+        ]
+
+        processo = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        stdout, stderr = await processo.communicate()
+
+        if processo.returncode == 0:
+
+            logging.info(
+                "Segmentos recodificados com sucesso."
+            )
+
+            try:
+                lista_file.unlink()
+            except Exception:
+                pass
+
+            return True
+
+        logging.error(
+            "Falha definitiva na conversão."
+        )
+
+        logging.error(
+            stderr.decode(
+                "utf-8",
+                errors="ignore"
+            )
+        )
+
+        return False
+
+    except Exception as erro:
+
+        logging.exception(
+            "Erro ao montar lista de segmentos."
+        )
+
+        return False
+
+
+# =========================================================
+# FINALIZAR GRAVAÇÃO
+# =========================================================
+
+async def finalizar_gravacao(
+    username,
+    chat_id
+):
+
+    try:
+
+        await asyncio.sleep(3)
+
+        arquivos = procurar_arquivos(
+            username
+        )
+
+        if not arquivos:
+
+            await telegram_app.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"⚠️ A gravação de @{username} "
+                    "terminou, mas nenhum arquivo foi encontrado."
+                )
+            )
+
+            return
+
+        tamanho_total = sum(
+            arquivo.stat().st_size
+            for arquivo in arquivos
+        )
+
+        tamanho_total_mb = (
+            tamanho_total /
+            (1024 * 1024)
+        )
+
+        await telegram_app.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "✅ Gravação finalizada!\n\n"
+                f"👤 @{username}\n"
+                f"🎞️ Segmentos: {len(arquivos)}\n"
+                f"📦 {tamanho_total_mb:.1f} MB\n\n"
+                "🔄 Convertendo para MP4..."
+            )
+        )
+
+        timestamp = datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
+        )
+
+        mp4_file = (
+            OUTPUT_DIR /
+            f"{username}_{timestamp}.mp4"
+        )
+
         convertido = await converter_para_mp4(
-            flv_file,
+            arquivos,
             mp4_file
         )
 
@@ -367,23 +541,19 @@ async def finalizar_arquivo(
             await telegram_app.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    f"❌ Não foi possível converter "
-                    f"@{username} para MP4."
+                    "❌ Não foi possível "
+                    "converter os arquivos para MP4."
                 )
             )
 
             return
-
-        # -------------------------------------------------
-        # VERIFICAR MP4
-        # -------------------------------------------------
 
         if not mp4_file.exists():
 
             await telegram_app.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    "❌ O FFmpeg informou que terminou, "
+                    "❌ O FFmpeg terminou, "
                     "mas o MP4 não foi encontrado."
                 )
             )
@@ -391,25 +561,14 @@ async def finalizar_arquivo(
             return
 
         tamanho_mp4 = (
-            mp4_file.stat().st_size
-            / (1024 * 1024)
-        )
-
-        logging.info(
-            "MP4 criado: %s",
-            mp4_file
-        )
-
-        logging.info(
-            "Tamanho: %.2f MB",
-            tamanho_mp4
+            mp4_file.stat().st_size /
+            (1024 * 1024)
         )
 
         await telegram_app.bot.send_message(
             chat_id=chat_id,
             text=(
                 "✅ MP4 pronto!\n\n"
-                f"👤 @{username}\n"
                 f"📦 {tamanho_mp4:.1f} MB\n\n"
                 "📤 Enviando para o Telegram..."
             )
@@ -432,7 +591,7 @@ async def finalizar_arquivo(
                     chat_id=chat_id,
                     video=video,
                     caption=(
-                        f"🎥 @{username}\n"
+                        f"🎥 Gravação de @{username}\n"
                         f"📦 {tamanho_mp4:.1f} MB"
                     ),
                     supports_streaming=True
@@ -440,19 +599,15 @@ async def finalizar_arquivo(
 
             enviado = True
 
-            logging.info(
-                "MP4 enviado como vídeo."
-            )
-
         except Exception as erro:
 
             logging.warning(
-                "Falha no envio como vídeo: %s",
+                "Falha ao enviar como vídeo: %s",
                 erro
             )
 
         # -------------------------------------------------
-        # FALLBACK: DOCUMENTO
+        # FALLBACK DOCUMENTO
         # -------------------------------------------------
 
         if not enviado:
@@ -475,14 +630,10 @@ async def finalizar_arquivo(
 
                 enviado = True
 
-                logging.info(
-                    "MP4 enviado como documento."
-                )
-
             except Exception as erro:
 
                 logging.exception(
-                    "Falha ao enviar MP4."
+                    "Erro ao enviar MP4."
                 )
 
                 await telegram_app.bot.send_message(
@@ -500,35 +651,30 @@ async def finalizar_arquivo(
 
         if enviado:
 
-            try:
+            for arquivo in arquivos:
 
-                if flv_file.exists():
-                    flv_file.unlink()
+                try:
 
-                logging.info(
-                    "FLV removido."
-                )
+                    if arquivo.exists():
+                        arquivo.unlink()
 
-            except Exception as erro:
+                except Exception as erro:
 
-                logging.warning(
-                    "Erro ao apagar FLV: %s",
-                    erro
-                )
+                    logging.warning(
+                        "Erro apagando %s: %s",
+                        arquivo,
+                        erro
+                    )
 
             try:
 
                 if mp4_file.exists():
                     mp4_file.unlink()
 
-                logging.info(
-                    "MP4 removido."
-                )
-
             except Exception as erro:
 
                 logging.warning(
-                    "Erro ao apagar MP4: %s",
+                    "Erro apagando MP4: %s",
                     erro
                 )
 
@@ -556,7 +702,7 @@ async def finalizar_arquivo(
 
 
 # =========================================================
-# GRAVAR
+# GRAVAÇÃO COM RECONEXÃO AUTOMÁTICA
 # =========================================================
 
 async def record_live(
@@ -574,7 +720,15 @@ async def record_live(
         f"@{username}/live"
     )
 
-    processo = None
+    inicio = datetime.now()
+
+    recordings[username] = {
+        "process": None,
+        "chat_id": chat_id,
+        "inicio": inicio,
+        "tentativas": 0,
+        "parar": False
+    }
 
     try:
 
@@ -586,156 +740,212 @@ async def record_live(
             )
         )
 
-        filename = (
-            OUTPUT_DIR /
-            f"{username}.%(ext)s"
-        )
-
         # =================================================
-        # FLV PRIMEIRO
+        # LOOP DE RECONEXÃO
         # =================================================
 
-        command = [
-            "yt-dlp",
+        while not recordings[username]["parar"]:
 
-            "--newline",
-
-            "--no-warnings",
-
-            "--no-color",
-
-            # FLV primeiro
-            "-f",
-            "best[ext=flv]/best",
-
-            # Tentativas
-            "--fragment-retries",
-            "20",
-
-            "--retries",
-            "10",
-
-            "--retry-sleep",
-            "2",
-
-            # Não criar .part
-            "--no-part",
-
-            # Arquivo
-            "-o",
-            str(filename),
-
-            url
-        ]
-
-        logging.info(
-            "========================================"
-        )
-
-        logging.info(
-            "INICIANDO GRAVAÇÃO"
-        )
-
-        logging.info(
-            "Usuário: @%s",
-            username
-        )
-
-        logging.info(
-            "Formato: FLV"
-        )
-
-        logging.info(
-            "Comando: %s",
-            " ".join(command)
-        )
-
-        logging.info(
-            "========================================"
-        )
-
-        processo = await asyncio.create_subprocess_exec(
-            *command,
-
-            stdout=asyncio.subprocess.PIPE,
-
-            stderr=asyncio.subprocess.STDOUT,
-
-            start_new_session=True
-        )
-
-        recordings[username] = {
-            "process": processo,
-            "chat_id": chat_id
-        }
-
-        await telegram_app.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "🔴 Gravação iniciada!\n\n"
-                f"👤 @{username}\n"
-                "🎞️ Formato: FLV"
+            data = recordings.get(
+                username
             )
-        )
 
-        # =================================================
-        # LER LOG
-        # =================================================
-
-        while True:
-
-            linha = await processo.stdout.readline()
-
-            if not linha:
+            if not data:
                 break
 
-            texto = linha.decode(
-                "utf-8",
-                errors="ignore"
-            ).strip()
+            data["tentativas"] += 1
 
-            if texto:
+            tentativa = data["tentativas"]
 
-                logging.info(
-                    "[%s] %s",
-                    username,
-                    texto
+            timestamp = datetime.now().strftime(
+                "%Y%m%d_%H%M%S"
+            )
+
+            filename = (
+                OUTPUT_DIR /
+                f"{username}_{timestamp}.%(ext)s"
+            )
+
+            command = [
+                "yt-dlp",
+
+                "--newline",
+
+                "--no-warnings",
+
+                "--no-color",
+
+                "-f",
+                "best[ext=flv]/best",
+
+                "--fragment-retries",
+                "20",
+
+                "--retries",
+                "10",
+
+                "--retry-sleep",
+                "2",
+
+                "--no-part",
+
+                "-o",
+                str(filename),
+
+                url
+            ]
+
+            logging.info(
+                "========================================"
+            )
+
+            logging.info(
+                "TENTATIVA DE GRAVAÇÃO: %s",
+                tentativa
+            )
+
+            logging.info(
+                "Usuário: @%s",
+                username
+            )
+
+            logging.info(
+                "========================================"
+            )
+
+            processo = None
+
+            try:
+
+                processo = await asyncio.create_subprocess_exec(
+                    *command,
+
+                    stdout=asyncio.subprocess.PIPE,
+
+                    stderr=asyncio.subprocess.STDOUT,
+
+                    start_new_session=True
                 )
 
-        await processo.wait()
+                recordings[username]["process"] = processo
 
-        logging.info(
-            "========================================"
-        )
+                if tentativa == 1:
 
-        logging.info(
-            "YT-DLP FINALIZOU"
-        )
+                    await telegram_app.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            "🔴 Gravação iniciada!\n\n"
+                            f"👤 @{username}\n"
+                            "🎞️ Formato: FLV\n"
+                            "🔄 Reconexão automática: ativada"
+                        )
+                    )
 
-        logging.info(
-            "Usuário: @%s",
-            username
-        )
+                else:
 
-        logging.info(
-            "Código: %s",
-            processo.returncode
-        )
+                    await telegram_app.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"🔄 Conexão restabelecida!\n\n"
+                            f"👤 @{username}\n"
+                            f"🔢 Tentativa: {tentativa}"
+                        )
+                    )
 
-        logging.info(
-            "========================================"
-        )
+                # -----------------------------------------
+                # LER LOG DO YT-DLP
+                # -----------------------------------------
+
+                while True:
+
+                    linha = await processo.stdout.readline()
+
+                    if not linha:
+                        break
+
+                    texto = linha.decode(
+                        "utf-8",
+                        errors="ignore"
+                    ).strip()
+
+                    if texto:
+
+                        logging.info(
+                            "[%s] %s",
+                            username,
+                            texto
+                        )
+
+                await processo.wait()
+
+                codigo = processo.returncode
+
+                logging.warning(
+                    "yt-dlp terminou. Código: %s",
+                    codigo
+                )
+
+            except Exception as erro:
+
+                logging.exception(
+                    "Erro executando yt-dlp: %s",
+                    erro
+                )
+
+            finally:
+
+                recordings[username]["process"] = None
+
+            # =================================================
+            # VERIFICAR SE O USUÁRIO MANDOU /PARAR
+            # =================================================
+
+            if recordings[username]["parar"]:
+
+                break
+
+            # =================================================
+            # CONEXÃO CAIU
+            # =================================================
+
+            await telegram_app.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"⚠️ Conexão com @{username} perdida.\n\n"
+                    f"🔄 Tentando reconectar em "
+                    f"{RECONNECT_SECONDS} segundos..."
+                )
+            )
+
+            logging.warning(
+                "Conexão perdida. "
+                "Reconectando em %s segundos.",
+                RECONNECT_SECONDS
+            )
+
+            # ---------------------------------------------
+            # CONTAGEM REGRESSIVA
+            # ---------------------------------------------
+
+            for _ in range(
+                RECONNECT_SECONDS
+            ):
+
+                if recordings[username]["parar"]:
+                    break
+
+                await asyncio.sleep(1)
+
+        # =================================================
+        # FINALIZAÇÃO
+        # =================================================
 
         recordings.pop(
             username,
             None
         )
 
-        # =================================================
-        # FINALIZAR
-        # =================================================
-
-        await finalizar_arquivo(
+        await finalizar_gravacao(
             username,
             chat_id
         )
@@ -743,23 +953,32 @@ async def record_live(
     except asyncio.CancelledError:
 
         logging.warning(
-            "Gravação cancelada: @%s",
+            "Gravação cancelada."
+        )
+
+        data = recordings.get(
             username
         )
 
-        if processo:
+        if data:
 
-            try:
+            processo = data.get(
+                "process"
+            )
 
-                if processo.returncode is None:
+            if processo:
 
-                    os.killpg(
-                        processo.pid,
-                        signal.SIGKILL
-                    )
+                try:
 
-            except Exception:
-                pass
+                    if processo.returncode is None:
+
+                        os.killpg(
+                            processo.pid,
+                            signal.SIGKILL
+                        )
+
+                except Exception:
+                    pass
 
         recordings.pop(
             username,
@@ -771,7 +990,7 @@ async def record_live(
     except Exception as erro:
 
         logging.exception(
-            "Erro na gravação."
+            "Erro geral na gravação."
         )
 
         recordings.pop(
@@ -856,45 +1075,58 @@ async def parar(
         recordings.items()
     ):
 
-        processo = data["process"]
+        # ---------------------------------------------
+        # MARCAR PARA NÃO RECONECTAR
+        # ---------------------------------------------
 
-        if processo.returncode is None:
+        data["parar"] = True
 
-            await update.message.reply_text(
-                f"⏹️ Parando @{username}..."
-            )
+        processo = data.get(
+            "process"
+        )
+
+        await update.message.reply_text(
+            f"⏹️ Parando @{username}..."
+        )
+
+        # ---------------------------------------------
+        # PARAR YT-DLP
+        # ---------------------------------------------
+
+        if processo:
 
             try:
 
-                # Parar de forma normal
-                os.killpg(
-                    processo.pid,
-                    signal.SIGINT
-                )
+                if processo.returncode is None:
 
-                try:
-
-                    await asyncio.wait_for(
-                        processo.wait(),
-                        timeout=20
-                    )
-
-                except asyncio.TimeoutError:
-
-                    logging.warning(
-                        "Processo não encerrou. "
-                        "Forçando encerramento."
+                    os.killpg(
+                        processo.pid,
+                        signal.SIGINT
                     )
 
                     try:
 
-                        os.killpg(
-                            processo.pid,
-                            signal.SIGKILL
+                        await asyncio.wait_for(
+                            processo.wait(),
+                            timeout=20
                         )
 
-                    except Exception:
-                        pass
+                    except asyncio.TimeoutError:
+
+                        logging.warning(
+                            "yt-dlp não encerrou. "
+                            "Forçando encerramento."
+                        )
+
+                        try:
+
+                            os.killpg(
+                                processo.pid,
+                                signal.SIGKILL
+                            )
+
+                        except Exception:
+                            pass
 
             except Exception as erro:
 
@@ -992,16 +1224,22 @@ async def shutdown():
         recordings.items()
     ):
 
-        processo = data["process"]
+        data["parar"] = True
 
-        if processo.returncode is None:
+        processo = data.get(
+            "process"
+        )
+
+        if processo:
 
             try:
 
-                os.killpg(
-                    processo.pid,
-                    signal.SIGKILL
-                )
+                if processo.returncode is None:
+
+                    os.killpg(
+                        processo.pid,
+                        signal.SIGKILL
+                    )
 
             except Exception:
                 pass
