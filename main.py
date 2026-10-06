@@ -33,7 +33,7 @@ recordings = {}
 
 
 # =========================================================
-# TELEGRAM
+# COMANDO /START
 # =========================================================
 
 async def start(
@@ -49,6 +49,10 @@ async def start(
         "/status - verificar status"
     )
 
+
+# =========================================================
+# COMANDO /STATUS
+# =========================================================
 
 async def status(
     update: Update,
@@ -74,10 +78,10 @@ async def status(
 
 
 # =========================================================
-# LOCALIZAR ARQUIVO
+# LOCALIZAR ARQUIVO FLV
 # =========================================================
 
-def procurar_arquivo(username):
+def procurar_flv(username):
 
     if not OUTPUT_DIR.exists():
         return None
@@ -87,21 +91,11 @@ def procurar_arquivo(username):
     )
 
     logging.info(
-        "Arquivos existentes: %s",
+        "Arquivos encontrados: %s",
         [arquivo.name for arquivo in arquivos]
     )
 
     candidatos = []
-
-    extensoes = {
-        ".mp4",
-        ".flv",
-        ".mkv",
-        ".ts",
-        ".webm",
-        ".m4v",
-        ".mov"
-    }
 
     for arquivo in arquivos:
 
@@ -119,7 +113,7 @@ def procurar_arquivo(username):
         if nome.endswith(".ytdl"):
             continue
 
-        if arquivo.suffix.lower() not in extensoes:
+        if arquivo.suffix.lower() != ".flv":
             continue
 
         try:
@@ -142,7 +136,148 @@ def procurar_arquivo(username):
 
 
 # =========================================================
-# FINALIZAR E ENVIAR
+# CONVERTER FLV -> MP4
+# =========================================================
+
+async def converter_para_mp4(
+    flv_file,
+    mp4_file
+):
+
+    logging.info(
+        "Convertendo FLV para MP4..."
+    )
+
+    # -----------------------------------------------------
+    # PRIMEIRA TENTATIVA:
+    # Apenas troca o container.
+    # É muito mais rápido porque não recodifica.
+    # -----------------------------------------------------
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(flv_file),
+        "-c",
+        "copy",
+        "-bsf:a",
+        "aac_adtstoasc",
+        str(mp4_file)
+    ]
+
+    logging.info(
+        "FFmpeg: %s",
+        " ".join(command)
+    )
+
+    processo = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+
+    stdout, stderr = await processo.communicate()
+
+    if processo.returncode == 0:
+
+        logging.info(
+            "Conversão para MP4 concluída."
+        )
+
+        return True
+
+    logging.warning(
+        "Conversão sem recodificação falhou."
+    )
+
+    logging.warning(
+        stderr.decode(
+            "utf-8",
+            errors="ignore"
+        )
+    )
+
+    # -----------------------------------------------------
+    # SEGUNDA TENTATIVA:
+    # Se o copy não funcionar, recodifica.
+    # -----------------------------------------------------
+
+    logging.info(
+        "Tentando conversão com recodificação..."
+    )
+
+    if mp4_file.exists():
+
+        try:
+            mp4_file.unlink()
+        except Exception:
+            pass
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(flv_file),
+
+        "-c:v",
+        "libx264",
+
+        "-preset",
+        "veryfast",
+
+        "-crf",
+        "23",
+
+        "-c:a",
+        "aac",
+
+        "-b:a",
+        "128k",
+
+        "-movflags",
+        "+faststart",
+
+        str(mp4_file)
+    ]
+
+    logging.info(
+        "FFmpeg recodificação: %s",
+        " ".join(command)
+    )
+
+    processo = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+
+    stdout, stderr = await processo.communicate()
+
+    if processo.returncode == 0:
+
+        logging.info(
+            "Recodificação concluída."
+        )
+
+        return True
+
+    logging.error(
+        "FFmpeg falhou definitivamente."
+    )
+
+    logging.error(
+        stderr.decode(
+            "utf-8",
+            errors="ignore"
+        )
+    )
+
+    return False
+
+
+# =========================================================
+# FINALIZAR GRAVAÇÃO
 # =========================================================
 
 async def finalizar_arquivo(
@@ -153,43 +288,41 @@ async def finalizar_arquivo(
     try:
 
         logging.info(
-            "Esperando arquivo de @%s...",
+            "Procurando FLV de @%s...",
             username
         )
 
+        # Dá alguns segundos para o arquivo terminar
         await asyncio.sleep(3)
 
-        arquivo = procurar_arquivo(
+        flv_file = procurar_flv(
             username
         )
 
-        if not arquivo:
+        if not flv_file:
 
             logging.error(
-                "Arquivo não encontrado para @%s",
-                username
+                "FLV não encontrado."
             )
 
             await telegram_app.bot.send_message(
                 chat_id=chat_id,
                 text=(
                     f"⚠️ A gravação de @{username} "
-                    "terminou, mas nenhum arquivo foi encontrado."
+                    "terminou, mas o FLV não foi encontrado."
                 )
             )
 
             return
 
-        tamanho = arquivo.stat().st_size
-
-        tamanho_mb = (
-            tamanho /
-            (1024 * 1024)
+        tamanho_flv = (
+            flv_file.stat().st_size
+            / (1024 * 1024)
         )
 
         logging.info(
-            "Arquivo encontrado: %s",
-            arquivo
+            "FLV encontrado: %s",
+            flv_file
         )
 
         await telegram_app.bot.send_message(
@@ -197,8 +330,87 @@ async def finalizar_arquivo(
             text=(
                 "✅ Gravação finalizada!\n\n"
                 f"👤 @{username}\n"
-                f"📁 {arquivo.name}\n"
-                f"📦 {tamanho_mb:.1f} MB\n\n"
+                f"📁 {flv_file.name}\n"
+                f"📦 {tamanho_flv:.1f} MB\n\n"
+                "🔄 Convertendo para MP4..."
+            )
+        )
+
+        # -------------------------------------------------
+        # NOME DO MP4
+        # -------------------------------------------------
+
+        mp4_file = (
+            OUTPUT_DIR /
+            f"{username}.mp4"
+        )
+
+        # Se existir algum MP4 antigo, remove
+        if mp4_file.exists():
+
+            try:
+                mp4_file.unlink()
+            except Exception:
+                pass
+
+        # -------------------------------------------------
+        # CONVERTER
+        # -------------------------------------------------
+
+        convertido = await converter_para_mp4(
+            flv_file,
+            mp4_file
+        )
+
+        if not convertido:
+
+            await telegram_app.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"❌ Não foi possível converter "
+                    f"@{username} para MP4."
+                )
+            )
+
+            return
+
+        # -------------------------------------------------
+        # VERIFICAR MP4
+        # -------------------------------------------------
+
+        if not mp4_file.exists():
+
+            await telegram_app.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "❌ O FFmpeg informou que terminou, "
+                    "mas o MP4 não foi encontrado."
+                )
+            )
+
+            return
+
+        tamanho_mp4 = (
+            mp4_file.stat().st_size
+            / (1024 * 1024)
+        )
+
+        logging.info(
+            "MP4 criado: %s",
+            mp4_file
+        )
+
+        logging.info(
+            "Tamanho: %.2f MB",
+            tamanho_mp4
+        )
+
+        await telegram_app.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "✅ MP4 pronto!\n\n"
+                f"👤 @{username}\n"
+                f"📦 {tamanho_mp4:.1f} MB\n\n"
                 "📤 Enviando para o Telegram..."
             )
         )
@@ -206,13 +418,13 @@ async def finalizar_arquivo(
         enviado = False
 
         # -------------------------------------------------
-        # TENTA ENVIAR COMO VÍDEO
+        # ENVIAR COMO VÍDEO
         # -------------------------------------------------
 
         try:
 
             with open(
-                arquivo,
+                mp4_file,
                 "rb"
             ) as video:
 
@@ -220,8 +432,8 @@ async def finalizar_arquivo(
                     chat_id=chat_id,
                     video=video,
                     caption=(
-                        f"🎥 Gravação de @{username}\n"
-                        f"📦 {tamanho_mb:.1f} MB"
+                        f"🎥 @{username}\n"
+                        f"📦 {tamanho_mp4:.1f} MB"
                     ),
                     supports_streaming=True
                 )
@@ -229,18 +441,18 @@ async def finalizar_arquivo(
             enviado = True
 
             logging.info(
-                "Vídeo enviado como vídeo."
+                "MP4 enviado como vídeo."
             )
 
         except Exception as erro:
 
             logging.warning(
-                "Falha ao enviar como vídeo: %s",
+                "Falha no envio como vídeo: %s",
                 erro
             )
 
         # -------------------------------------------------
-        # SE FALHAR, ENVIA COMO DOCUMENTO
+        # FALLBACK: DOCUMENTO
         # -------------------------------------------------
 
         if not enviado:
@@ -248,7 +460,7 @@ async def finalizar_arquivo(
             try:
 
                 with open(
-                    arquivo,
+                    mp4_file,
                     "rb"
                 ) as documento:
 
@@ -257,56 +469,74 @@ async def finalizar_arquivo(
                         document=documento,
                         caption=(
                             f"🎥 Gravação de @{username}\n"
-                            f"📦 {tamanho_mb:.1f} MB"
+                            f"📦 {tamanho_mp4:.1f} MB"
                         )
                     )
 
                 enviado = True
 
                 logging.info(
-                    "Arquivo enviado como documento."
+                    "MP4 enviado como documento."
                 )
 
             except Exception as erro:
 
                 logging.exception(
-                    "Falha ao enviar arquivo."
+                    "Falha ao enviar MP4."
                 )
 
                 await telegram_app.bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        "❌ Não consegui enviar o vídeo "
-                        "para o Telegram.\n\n"
+                        "❌ Não consegui enviar "
+                        "o MP4 para o Telegram.\n\n"
                         f"Erro: {erro}"
                     )
                 )
 
         # -------------------------------------------------
-        # APAGA APENAS DEPOIS DO ENVIO
+        # APAGAR ARQUIVOS
         # -------------------------------------------------
 
         if enviado:
 
             try:
 
-                arquivo.unlink()
+                if flv_file.exists():
+                    flv_file.unlink()
 
                 logging.info(
-                    "Arquivo removido do Render."
+                    "FLV removido."
                 )
 
             except Exception as erro:
 
                 logging.warning(
-                    "Erro ao apagar arquivo: %s",
+                    "Erro ao apagar FLV: %s",
+                    erro
+                )
+
+            try:
+
+                if mp4_file.exists():
+                    mp4_file.unlink()
+
+                logging.info(
+                    "MP4 removido."
+                )
+
+            except Exception as erro:
+
+                logging.warning(
+                    "Erro ao apagar MP4: %s",
                     erro
                 )
 
             await telegram_app.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    "✅ Vídeo enviado com sucesso! 🎥"
+                    "✅ Vídeo enviado com sucesso! 🎥\n"
+                    "🗑️ Arquivos temporários removidos."
                 )
             )
 
@@ -326,7 +556,7 @@ async def finalizar_arquivo(
 
 
 # =========================================================
-# GRAVAÇÃO
+# GRAVAR
 # =========================================================
 
 async def record_live(
@@ -356,21 +586,14 @@ async def record_live(
             )
         )
 
-        # -------------------------------------------------
-        # NOME DO ARQUIVO
-        # -------------------------------------------------
-
         filename = (
             OUTPUT_DIR /
             f"{username}.%(ext)s"
         )
 
-        # -------------------------------------------------
-        # YT-DLP
-        #
-        # FLV é priorizado quando disponível.
-        # HLS continua como fallback.
-        # -------------------------------------------------
+        # =================================================
+        # FLV PRIMEIRO
+        # =================================================
 
         command = [
             "yt-dlp",
@@ -381,12 +604,11 @@ async def record_live(
 
             "--no-color",
 
-            # Tenta FLV primeiro.
-            # Se não existir, usa o melhor formato.
+            # FLV primeiro
             "-f",
-            "best[protocol*=http][ext=flv]/best",
+            "best[ext=flv]/best",
 
-            # Tenta novamente segmentos HLS
+            # Tentativas
             "--fragment-retries",
             "20",
 
@@ -396,10 +618,10 @@ async def record_live(
             "--retry-sleep",
             "2",
 
-            # Mantém o arquivo final.
+            # Não criar .part
             "--no-part",
 
-            # Nome do arquivo.
+            # Arquivo
             "-o",
             str(filename),
 
@@ -411,8 +633,16 @@ async def record_live(
         )
 
         logging.info(
-            "INICIANDO GRAVAÇÃO: @%s",
+            "INICIANDO GRAVAÇÃO"
+        )
+
+        logging.info(
+            "Usuário: @%s",
             username
+        )
+
+        logging.info(
+            "Formato: FLV"
         )
 
         logging.info(
@@ -431,8 +661,6 @@ async def record_live(
 
             stderr=asyncio.subprocess.STDOUT,
 
-            # Cria grupo de processos.
-            # Assim conseguimos parar yt-dlp + FFmpeg.
             start_new_session=True
         )
 
@@ -445,13 +673,14 @@ async def record_live(
             chat_id=chat_id,
             text=(
                 "🔴 Gravação iniciada!\n\n"
-                f"👤 @{username}"
+                f"👤 @{username}\n"
+                "🎞️ Formato: FLV"
             )
         )
 
-        # -------------------------------------------------
-        # LER LOG DO YT-DLP
-        # -------------------------------------------------
+        # =================================================
+        # LER LOG
+        # =================================================
 
         while True:
 
@@ -476,12 +705,25 @@ async def record_live(
         await processo.wait()
 
         logging.info(
-            "yt-dlp terminou."
+            "========================================"
         )
 
         logging.info(
-            "Código de saída: %s",
+            "YT-DLP FINALIZOU"
+        )
+
+        logging.info(
+            "Usuário: @%s",
+            username
+        )
+
+        logging.info(
+            "Código: %s",
             processo.returncode
+        )
+
+        logging.info(
+            "========================================"
         )
 
         recordings.pop(
@@ -489,9 +731,9 @@ async def record_live(
             None
         )
 
-        # -------------------------------------------------
-        # PROCESSAR ARQUIVO
-        # -------------------------------------------------
+        # =================================================
+        # FINALIZAR
+        # =================================================
 
         await finalizar_arquivo(
             username,
@@ -624,8 +866,7 @@ async def parar(
 
             try:
 
-                # Primeiro tenta finalizar
-                # de forma normal.
+                # Parar de forma normal
                 os.killpg(
                     processo.pid,
                     signal.SIGINT
@@ -641,8 +882,8 @@ async def parar(
                 except asyncio.TimeoutError:
 
                     logging.warning(
-                        "yt-dlp não encerrou "
-                        "em 20 segundos."
+                        "Processo não encerrou. "
+                        "Forçando encerramento."
                     )
 
                     try:
@@ -658,7 +899,7 @@ async def parar(
             except Exception as erro:
 
                 logging.exception(
-                    "Erro ao parar."
+                    "Erro ao parar gravação."
                 )
 
                 await update.message.reply_text(
@@ -668,7 +909,7 @@ async def parar(
 
 
 # =========================================================
-# TELEGRAM HANDLERS
+# HANDLERS
 # =========================================================
 
 telegram_app.add_handler(
