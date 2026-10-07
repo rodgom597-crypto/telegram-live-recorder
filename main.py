@@ -1,4 +1,3 @@
-```python
 import os
 import json
 import asyncio
@@ -112,10 +111,12 @@ async def enviar_mensagem(chat_id, texto):
 
 async def verificar_live(username: str):
     """
-    Verifica o estado da live usando yt-dlp.
+    Verifica se a conta está ao vivo usando yt-dlp.
 
-    Consideramos ao vivo somente quando o JSON
-    retorna is_live=True.
+    Retorna:
+
+        True  = ao vivo confirmado
+        False = offline confirmado ou não disponível
     """
 
     username = normalizar_usuario(username)
@@ -150,6 +151,10 @@ async def verificar_live(username: str):
             "utf-8",
             errors="ignore"
         )
+
+        # ----------------------------------------------------
+        # Tenta interpretar JSON
+        # ----------------------------------------------------
 
         linhas = [
             linha.strip()
@@ -186,7 +191,12 @@ async def verificar_live(username: str):
                         return False
 
             except json.JSONDecodeError:
+
                 continue
+
+        # ----------------------------------------------------
+        # Retorno explícito do yt-dlp
+        # ----------------------------------------------------
 
         if "not currently live" in erro.lower():
 
@@ -196,6 +206,10 @@ async def verificar_live(username: str):
             )
 
             return False
+
+        # ----------------------------------------------------
+        # Sem confirmação
+        # ----------------------------------------------------
 
         if processo.returncode == 0:
 
@@ -242,6 +256,21 @@ def procurar_arquivos(username: str):
 
 # ============================================================
 # CONVERSÃO FLV -> MP4
+#
+# Esta versão REENCODA o vídeo.
+#
+# Isso é importante porque algumas mudanças de cena do TikTok,
+# principalmente BATALHAS, podem deixar determinados frames
+# corrompidos no fluxo original.
+#
+# O FFmpeg tenta:
+#
+# - ignorar pacotes corrompidos
+# - reconstruir timestamps
+# - descartar frames/pacotes problemáticos
+# - reencodar para H264
+# - converter áudio para AAC
+# - gerar MP4 compatível
 # ============================================================
 
 async def converter_para_mp4(
@@ -260,34 +289,18 @@ async def converter_para_mp4(
     )
 
     # ========================================================
-    # UM ÚNICO FLV
+    # APENAS UM FLV
     # ========================================================
 
     if len(arquivos) == 1:
 
         flv = arquivos[0]
 
-        logger.info(
-            "[%s] Iniciando conversão/reparação do FLV.",
-            username
-        )
-
-        # ----------------------------------------------------
-        # IMPORTANTE:
-        #
-        # Não usamos mais -c copy como primeira opção.
-        #
-        # O vídeo pode conter frames problemáticos,
-        # principalmente quando o TikTok muda o fluxo
-        # durante uma batalha.
-        #
-        # Forçamos uma nova decodificação/reencodificação.
-        # ----------------------------------------------------
-
         comando = [
             "ffmpeg",
             "-y",
 
+            # Tratamento de timestamps/pacotes
             "-fflags",
             "+genpts+discardcorrupt",
 
@@ -297,9 +310,11 @@ async def converter_para_mp4(
             "-i",
             str(flv),
 
+            # Vídeo
             "-map",
             "0:v:0?",
 
+            # Áudio
             "-map",
             "0:a:0?",
 
@@ -315,17 +330,24 @@ async def converter_para_mp4(
             "-pix_fmt",
             "yuv420p",
 
+            # Áudio
             "-c:a",
             "aac",
 
             "-b:a",
             "128k",
 
+            # MP4
             "-movflags",
             "+faststart",
 
             str(mp4_final),
         ]
+
+        logger.info(
+            "[%s] Reencodando FLV para MP4.",
+            username
+        )
 
         processo = await asyncio.create_subprocess_exec(
             *comando,
@@ -335,41 +357,34 @@ async def converter_para_mp4(
 
         _, stderr = await processo.communicate()
 
-        erro_ffmpeg = stderr.decode(
-            "utf-8",
-            errors="ignore"
-        )
-
         if processo.returncode == 0 and mp4_final.exists():
 
             logger.info(
-                "[%s] MP4 reparado/reencodado com sucesso.",
+                "[%s] MP4 criado com sucesso.",
                 username
             )
 
             return mp4_final
 
+        # ====================================================
+        # FALLBACK
+        # ====================================================
+
         logger.warning(
             "[%s] Primeira conversão falhou. "
-            "Tentando conversão alternativa.",
+            "Tentando modo de recuperação.",
             username
         )
 
         if mp4_final.exists():
             mp4_final.unlink()
 
-        # ----------------------------------------------------
-        # SEGUNDA TENTATIVA
-        #
-        # Mais permissiva para streams com erros.
-        # ----------------------------------------------------
-
         comando = [
             "ffmpeg",
             "-y",
 
             "-fflags",
-            "+genpts",
+            "+genpts+discardcorrupt",
 
             "-err_detect",
             "ignore_err",
@@ -399,7 +414,7 @@ async def converter_para_mp4(
             "aac",
 
             "-b:a",
-            "128k",
+            "96k",
 
             "-movflags",
             "+faststart",
@@ -413,27 +428,24 @@ async def converter_para_mp4(
             stderr=asyncio.subprocess.PIPE,
         )
 
-        _, stderr2 = await processo.communicate()
-
-        erro_ffmpeg2 = stderr2.decode(
-            "utf-8",
-            errors="ignore"
-        )
+        _, stderr = await processo.communicate()
 
         if processo.returncode == 0 and mp4_final.exists():
 
             logger.info(
-                "[%s] Segunda tentativa concluída.",
+                "[%s] MP4 criado pelo modo de recuperação.",
                 username
             )
 
             return mp4_final
 
         logger.error(
-            "[%s] Falha na conversão.\n%s\n%s",
+            "[%s] Falha na conversão: %s",
             username,
-            erro_ffmpeg[-3000:],
-            erro_ffmpeg2[-3000:]
+            stderr.decode(
+                "utf-8",
+                errors="ignore"
+            )[-5000:]
         )
 
         return None
@@ -449,29 +461,28 @@ async def converter_para_mp4(
 
     try:
 
-        with open(lista, "w", encoding="utf-8") as f:
+        with open(
+            lista,
+            "w",
+            encoding="utf-8"
+        ) as f:
 
             for arquivo in arquivos:
 
                 caminho = str(
                     arquivo.resolve()
-                ).replace("'", "'\\''")
+                ).replace(
+                    "'",
+                    "'\\''"
+                )
 
                 f.write(
                     f"file '{caminho}'\n"
                 )
 
-        logger.info(
-            "[%s] Preparando %d arquivos FLV.",
-            username,
-            len(arquivos)
-        )
-
-        # ----------------------------------------------------
-        # PRIMEIRA TENTATIVA:
-        #
-        # Concatena e já reencoda.
-        # ----------------------------------------------------
+        # ====================================================
+        # PRIMEIRA TENTATIVA
+        # ====================================================
 
         comando = [
             "ffmpeg",
@@ -523,8 +534,9 @@ async def converter_para_mp4(
         ]
 
         logger.info(
-            "[%s] Juntando e reencodando os FLV.",
-            username
+            "[%s] Juntando %d arquivos FLV.",
+            username,
+            len(arquivos)
         )
 
         processo = await asyncio.create_subprocess_exec(
@@ -535,38 +547,34 @@ async def converter_para_mp4(
 
         _, stderr = await processo.communicate()
 
-        erro_ffmpeg = stderr.decode(
-            "utf-8",
-            errors="ignore"
-        )
-
         if processo.returncode == 0 and mp4_final.exists():
 
             logger.info(
-                "[%s] MP4 final criado com sucesso.",
+                "[%s] MP4 final criado.",
                 username
             )
 
             return mp4_final
 
+        # ====================================================
+        # FALLBACK
+        # ====================================================
+
         logger.warning(
-            "[%s] Primeira concatenação/reencodificação falhou.",
+            "[%s] Primeira concatenação falhou. "
+            "Tentando recuperação.",
             username
         )
 
         if mp4_final.exists():
             mp4_final.unlink()
 
-        # ----------------------------------------------------
-        # SEGUNDA TENTATIVA
-        # ----------------------------------------------------
-
         comando = [
             "ffmpeg",
             "-y",
 
             "-fflags",
-            "+genpts",
+            "+genpts+discardcorrupt",
 
             "-err_detect",
             "ignore_err",
@@ -602,7 +610,7 @@ async def converter_para_mp4(
             "aac",
 
             "-b:a",
-            "128k",
+            "96k",
 
             "-movflags",
             "+faststart",
@@ -616,27 +624,24 @@ async def converter_para_mp4(
             stderr=asyncio.subprocess.PIPE,
         )
 
-        _, stderr2 = await processo.communicate()
-
-        erro_ffmpeg2 = stderr2.decode(
-            "utf-8",
-            errors="ignore"
-        )
+        _, stderr = await processo.communicate()
 
         if processo.returncode == 0 and mp4_final.exists():
 
             logger.info(
-                "[%s] Segunda tentativa concluída.",
+                "[%s] MP4 criado pelo modo de recuperação.",
                 username
             )
 
             return mp4_final
 
         logger.error(
-            "[%s] Falha ao criar MP4.\n%s\n%s",
+            "[%s] Falha ao juntar gravações: %s",
             username,
-            erro_ffmpeg[-3000:],
-            erro_ffmpeg2[-3000:]
+            stderr.decode(
+                "utf-8",
+                errors="ignore"
+            )[-5000:]
         )
 
         return None
@@ -644,6 +649,7 @@ async def converter_para_mp4(
     finally:
 
         if lista.exists():
+
             lista.unlink()
 
 
@@ -693,7 +699,9 @@ async def finalizar_gravacao(
     try:
 
         tamanho_mb = (
-            mp4.stat().st_size / 1024 / 1024
+            mp4.stat().st_size
+            / 1024
+            / 1024
         )
 
         logger.info(
@@ -704,12 +712,15 @@ async def finalizar_gravacao(
 
         await telegram_app.bot.send_video(
             chat_id=chat_id,
+
             video=mp4.open("rb"),
+
             caption=(
                 f"🎥 Gravação finalizada\n"
                 f"👤 @{username}\n"
                 f"📦 {tamanho_mb:.2f} MB"
             ),
+
             supports_streaming=True,
         )
 
@@ -725,7 +736,9 @@ async def finalizar_gravacao(
 
             await telegram_app.bot.send_document(
                 chat_id=chat_id,
+
                 document=mp4.open("rb"),
+
                 caption=(
                     f"🎥 Gravação de @{username}"
                 ),
@@ -744,18 +757,20 @@ async def finalizar_gravacao(
                 f"❌ Erro ao enviar o vídeo: {e2}"
             )
 
-    # --------------------------------------------------------
+    # ========================================================
     # LIMPEZA
-    # --------------------------------------------------------
+    # ========================================================
 
     try:
 
         if mp4.exists():
+
             mp4.unlink()
 
         for arquivo in arquivos:
 
             if arquivo.exists():
+
                 arquivo.unlink()
 
     except Exception as e:
@@ -778,6 +793,7 @@ async def record_live(
 
     username = normalizar_usuario(username)
 
+    # Remove pedido de parada anterior
     stop_requests.discard(username)
 
     reconnect_counts[username] = 0
@@ -798,9 +814,9 @@ async def record_live(
 
         while True:
 
-            # ------------------------------------------------
+            # =================================================
             # PARADA MANUAL
-            # ------------------------------------------------
+            # =================================================
 
             if username in stop_requests:
 
@@ -811,9 +827,9 @@ async def record_live(
 
                 break
 
-            # ------------------------------------------------
+            # =================================================
             # URL
-            # ------------------------------------------------
+            # =================================================
 
             url = (
                 f"https://www.tiktok.com/"
@@ -828,9 +844,9 @@ async def record_live(
                 f"{username}_{timestamp}.flv"
             )
 
-            # ------------------------------------------------
+            # =================================================
             # YT-DLP
-            # ------------------------------------------------
+            # =================================================
 
             comando = [
                 "yt-dlp",
@@ -839,9 +855,13 @@ async def record_live(
                 "best[ext=flv]/best",
 
                 "--no-part",
+
                 "--no-continue",
+
                 "--no-overwrites",
+
                 "--no-warnings",
+
                 "--newline",
 
                 "-o",
@@ -872,6 +892,7 @@ async def record_live(
                     linha = await processo.stdout.readline()
 
                     if not linha:
+
                         break
 
                     texto = linha.decode(
@@ -891,7 +912,10 @@ async def record_live(
 
                 codigo = await processo.wait()
 
-                recordings.pop(username, None)
+                recordings.pop(
+                    username,
+                    None
+                )
 
                 texto_completo = "\n".join(
                     saida[-30:]
@@ -914,7 +938,9 @@ async def record_live(
 
                     if recordings.get(username):
 
-                        recordings[username].terminate()
+                        recordings[
+                            username
+                        ].terminate()
 
                 except Exception:
                     pass
@@ -929,15 +955,18 @@ async def record_live(
                     e
                 )
 
-                recordings.pop(username, None)
+                recordings.pop(
+                    username,
+                    None
+                )
 
                 texto_completo = str(e)
 
                 codigo = -1
 
-            # ------------------------------------------------
+            # =================================================
             # PARADA MANUAL
-            # ------------------------------------------------
+            # =================================================
 
             if username in stop_requests:
 
@@ -948,14 +977,18 @@ async def record_live(
 
                 break
 
-            # ------------------------------------------------
-            # ANALISAR ARQUIVO
-            # ------------------------------------------------
+            # =================================================
+            # VERIFICAR ARQUIVO
+            # =================================================
 
             arquivo_gerado = (
                 arquivo.exists()
                 and arquivo.stat().st_size > 0
             )
+
+            # =================================================
+            # ERRO OFFLINE
+            # =================================================
 
             erro_offline = (
                 "not currently live"
@@ -976,9 +1009,9 @@ async def record_live(
 
                 break
 
-            # ------------------------------------------------
+            # =================================================
             # ARQUIVO GERADO
-            # ------------------------------------------------
+            # =================================================
 
             if arquivo_gerado:
 
@@ -987,9 +1020,9 @@ async def record_live(
                     username
                 )
 
-            # ------------------------------------------------
-            # VERIFICAR LIVE
-            # ------------------------------------------------
+            # =================================================
+            # VERIFICAR SE A LIVE CONTINUA
+            # =================================================
 
             ainda_ativa = False
 
@@ -1005,15 +1038,18 @@ async def record_live(
                     False
                 )
 
+            # Se o monitor não confirmou,
+            # fazemos verificação direta.
+
             if not ainda_ativa:
 
                 ainda_ativa = await verificar_live(
                     username
                 )
 
-            # ------------------------------------------------
+            # =================================================
             # LIVE TERMINOU
-            # ------------------------------------------------
+            # =================================================
 
             if not ainda_ativa:
 
@@ -1024,15 +1060,20 @@ async def record_live(
 
                 break
 
-            # ------------------------------------------------
-            # LIVE AINDA ESTÁ ATIVA
-            # ------------------------------------------------
+            # =================================================
+            # LIVE CONTINUA
+            # =================================================
 
             reconnect_counts[username] = (
-                reconnect_counts.get(username, 0) + 1
+                reconnect_counts.get(
+                    username,
+                    0
+                ) + 1
             )
 
-            tentativa = reconnect_counts[username]
+            tentativa = reconnect_counts[
+                username
+            ]
 
             logger.warning(
                 "[%s] Conexão caiu, mas a live "
@@ -1056,11 +1097,19 @@ async def record_live(
 
     finally:
 
-        recordings.pop(username, None)
+        recordings.pop(
+            username,
+            None
+        )
 
-        reconnect_counts.pop(username, None)
+        reconnect_counts.pop(
+            username,
+            None
+        )
 
-        stop_requests.discard(username)
+        stop_requests.discard(
+            username
+        )
 
         logger.info(
             "[%s] Finalizando gravação.",
@@ -1120,7 +1169,7 @@ async def cmd_ajuda(
         "Monitora automaticamente uma conta.\n\n"
 
         "/desmonitorar usuario\n"
-        "Remove uma conta do monitoramento.\n\n"
+        "Para o monitoramento.\n\n"
 
         "/monitorados\n"
         "Lista as contas monitoradas.\n\n"
@@ -1373,9 +1422,9 @@ async def monitorar_usuario(
                 username
             )
 
-            # ------------------------------------------------
+            # =================================================
             # ENTROU AO VIVO
-            # ------------------------------------------------
+            # =================================================
 
             if ao_vivo and not estava_ao_vivo:
 
@@ -1404,9 +1453,9 @@ async def monitorar_usuario(
                         )
                     )
 
-            # ------------------------------------------------
+            # =================================================
             # CONTINUA AO VIVO
-            # ------------------------------------------------
+            # =================================================
 
             elif ao_vivo:
 
@@ -1414,9 +1463,9 @@ async def monitorar_usuario(
                     "live"
                 ] = True
 
-            # ------------------------------------------------
+            # =================================================
             # SAIU DO AR
-            # ------------------------------------------------
+            # =================================================
 
             elif not ao_vivo and estava_ao_vivo:
 
@@ -1436,9 +1485,9 @@ async def monitorar_usuario(
                     f"não está mais sendo detectada como ao vivo."
                 )
 
-            # ------------------------------------------------
+            # =================================================
             # OFFLINE
-            # ------------------------------------------------
+            # =================================================
 
             else:
 
@@ -1473,5 +1522,415 @@ async def monitorar_usuario(
         )
 
         logger.info(
-            "[%s] Monitoramento e
-```
+            "[%s] Monitoramento encerrado.",
+            username
+        )
+
+
+# ============================================================
+# /DESMONITORAR
+# ============================================================
+
+async def cmd_desmonitorar(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    chat_id = update.effective_chat.id
+
+    if not context.args:
+
+        await enviar_mensagem(
+            chat_id,
+            "Use:\n/desmonitorar usuario"
+        )
+
+        return
+
+    username = normalizar_usuario(
+        context.args[0]
+    )
+
+    task = monitor_tasks.get(
+        username
+    )
+
+    if task:
+
+        task.cancel()
+
+    monitor_tasks.pop(
+        username,
+        None
+    )
+
+    if username in monitored_users:
+
+        monitored_users.pop(
+            username,
+            None
+        )
+
+        await enviar_mensagem(
+            chat_id,
+            f"🛑 Monitoramento de @{username} "
+            f"desativado."
+        )
+
+    else:
+
+        await enviar_mensagem(
+            chat_id,
+            f"ℹ️ @{username} não estava sendo monitorado."
+        )
+
+
+# ============================================================
+# /MONITORADOS
+# ============================================================
+
+async def cmd_monitorados(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    chat_id = update.effective_chat.id
+
+    if not monitored_users:
+
+        await enviar_mensagem(
+            chat_id,
+            "📭 Nenhuma conta monitorada."
+        )
+
+        return
+
+    linhas = [
+        "👁️ CONTAS MONITORADAS\n"
+    ]
+
+    for username, info in monitored_users.items():
+
+        if info.get("live"):
+
+            estado = "🔴 AO VIVO"
+
+        else:
+
+            estado = "⚫ offline"
+
+        linhas.append(
+            f"• @{username} — {estado}"
+        )
+
+    await enviar_mensagem(
+        chat_id,
+        "\n".join(linhas)
+    )
+
+
+# ============================================================
+# CONFIGURAR COMANDOS
+# ============================================================
+
+async def configurar_comandos():
+
+    try:
+
+        await telegram_app.bot.set_my_commands(
+            BOT_COMMANDS
+        )
+
+        logger.info(
+            "Comandos do Telegram configurados."
+        )
+
+    except Exception as e:
+
+        logger.error(
+            "Erro configurando comandos: %s",
+            e
+        )
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+@app.on_event("startup")
+async def startup():
+
+    global telegram_app
+
+    logger.info(
+        "🚀 Iniciando bot..."
+    )
+
+    telegram_app = (
+        Application.builder()
+        .token(TOKEN)
+        .build()
+    )
+
+    # ========================================================
+    # HANDLERS
+    # ========================================================
+
+    telegram_app.add_handler(
+        CommandHandler(
+            "start",
+            cmd_start
+        )
+    )
+
+    telegram_app.add_handler(
+        CommandHandler(
+            "ajuda",
+            cmd_ajuda
+        )
+    )
+
+    telegram_app.add_handler(
+        CommandHandler(
+            "gravar",
+            cmd_gravar
+        )
+    )
+
+    telegram_app.add_handler(
+        CommandHandler(
+            "parar",
+            cmd_parar
+        )
+    )
+
+    telegram_app.add_handler(
+        CommandHandler(
+            "status",
+            cmd_status
+        )
+    )
+
+    telegram_app.add_handler(
+        CommandHandler(
+            "monitorar",
+            cmd_monitorar
+        )
+    )
+
+    telegram_app.add_handler(
+        CommandHandler(
+            "desmonitorar",
+            cmd_desmonitorar
+        )
+    )
+
+    telegram_app.add_handler(
+        CommandHandler(
+            "monitorados",
+            cmd_monitorados
+        )
+    )
+
+    # ========================================================
+    # TELEGRAM
+    # ========================================================
+
+    await telegram_app.initialize()
+
+    await telegram_app.start()
+
+    await configurar_comandos()
+
+    # ========================================================
+    # WEBHOOK
+    # ========================================================
+
+    if RENDER_EXTERNAL_URL:
+
+        webhook_url = (
+            f"{RENDER_EXTERNAL_URL}"
+            f"/telegram/webhook"
+        )
+
+        await telegram_app.bot.set_webhook(
+            url=webhook_url
+        )
+
+        logger.info(
+            "Webhook configurado: %s",
+            webhook_url
+        )
+
+    else:
+
+        logger.warning(
+            "RENDER_EXTERNAL_URL não configurada."
+        )
+
+    logger.info(
+        "🤖 Bot iniciado com sucesso."
+    )
+
+
+# ============================================================
+# SHUTDOWN
+# ============================================================
+
+@app.on_event("shutdown")
+async def shutdown():
+
+    global telegram_app
+
+    logger.info(
+        "🛑 Encerrando bot..."
+    )
+
+    # ========================================================
+    # PARA GRAVAÇÕES
+    # ========================================================
+
+    for username, processo in list(
+        recordings.items()
+    ):
+
+        try:
+
+            if processo:
+
+                processo.terminate()
+
+        except Exception:
+
+            pass
+
+    # ========================================================
+    # CANCELA MONITORES
+    # ========================================================
+
+    for username, task in list(
+        monitor_tasks.items()
+    ):
+
+        try:
+
+            task.cancel()
+
+        except Exception:
+
+            pass
+
+    monitor_tasks.clear()
+
+    # ========================================================
+    # TELEGRAM
+    # ========================================================
+
+    if telegram_app:
+
+        try:
+
+            await telegram_app.stop()
+
+        except Exception as e:
+
+            logger.error(
+                "Erro parando aplicação Telegram: %s",
+                e
+            )
+
+        try:
+
+            await telegram_app.shutdown()
+
+        except Exception as e:
+
+            logger.error(
+                "Erro no shutdown Telegram: %s",
+                e
+            )
+
+    logger.info(
+        "Bot encerrado."
+    )
+
+
+# ============================================================
+# WEBHOOK TELEGRAM
+# ============================================================
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(
+    request: Request
+):
+
+    try:
+
+        data = await request.json()
+
+        update = Update.de_json(
+            data,
+            telegram_app.bot
+        )
+
+        await telegram_app.process_update(
+            update
+        )
+
+        return {
+            "ok": True
+        }
+
+    except Exception as e:
+
+        logger.error(
+            "Erro no webhook: %s",
+            e
+        )
+
+        return {
+            "ok": False,
+            "error": str(e)
+        }
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.get("/")
+async def root():
+
+    return {
+        "status": "online",
+        "bot": "telegram-live-recorder"
+    }
+
+
+@app.get("/health")
+async def health():
+
+    return {
+        "status": "ok",
+
+        "recordings": list(
+            recordings.keys()
+        ),
+
+        "monitored": list(
+            monitored_users.keys()
+        )
+    }
+
+
+# ============================================================
+# FALLBACK
+# ============================================================
+
+@app.get(
+    "/telegram/webhook",
+    response_class=PlainTextResponse
+)
+async def webhook_get():
+
+    return "Telegram Live Recorder OK"
