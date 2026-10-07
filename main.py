@@ -40,9 +40,21 @@ OUTPUT_DIR.mkdir(
     exist_ok=True
 )
 
+# Intervalo normal do monitoramento
 MONITOR_INTERVAL = 30
 
+# Tempo entre tentativas de recuperação
 RECONNECT_SECONDS = 10
+
+# Quantidade de verificações negativas consecutivas
+# antes de considerar que realmente saiu do ar.
+OFFLINE_CONFIRMATIONS = 3
+
+# Intervalo entre tentativas de verificar uma LIVE
+VERIFICATION_RETRY_SECONDS = 10
+
+# Tentativas para confirmar uma resposta negativa
+VERIFICATION_RETRIES = 3
 
 
 # ============================================================
@@ -63,7 +75,6 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-
 telegram_app = None
 
 
@@ -83,18 +94,14 @@ MONITORED_KEY = "tiktok:monitored_users"
 # username -> processo yt-dlp
 recordings = {}
 
-
 # username -> informações do monitoramento
 monitored_users = {}
-
 
 # username -> asyncio.Task do monitor
 monitor_tasks = {}
 
-
 # username -> pedido explícito para parar
 stop_requests = set()
-
 
 # username -> quantidade de reconexões
 reconnect_counts = {}
@@ -325,7 +332,9 @@ async def carregar_monitorados():
 
             return
 
-        lista = json.loads(dados)
+        lista = json.loads(
+            dados
+        )
 
         if not isinstance(
             lista,
@@ -354,6 +363,9 @@ async def carregar_monitorados():
                 "live": False,
 
                 "started_at": None,
+
+                # Contador para evitar falso offline
+                "offline_checks": 0,
             }
 
         logger.info(
@@ -428,12 +440,19 @@ async def iniciar_monitores_salvos():
 
 
 # ============================================================
-# VERIFICAR LIVE
+# VERIFICAR LIVE - BAIXO NÍVEL
 # ============================================================
 
-async def verificar_live(
+async def verificar_live_once(
     username: str
 ):
+    """
+    Retorna:
+
+    True  = confirmou LIVE
+    False = recebeu resposta de offline
+    None  = não conseguiu confirmar
+    """
 
     username = normalizar_usuario(
         username
@@ -496,54 +515,103 @@ async def verificar_live(
                     linha
                 )
 
-                if isinstance(
+                if not isinstance(
                     dados,
                     dict
                 ):
+                    continue
 
-                    is_live = dados.get(
-                        "is_live"
+                # Alguns retornos do yt-dlp podem trazer
+                # live_status em vez de is_live.
+                live_status = dados.get(
+                    "live_status"
+                )
+
+                if live_status == "is_live":
+
+                    logger.info(
+                        "[%s] VERIFICAÇÃO: AO VIVO "
+                        "(live_status)",
+                        username
                     )
 
-                    if is_live is True:
+                    return True
 
-                        logger.info(
-                            "[%s] VERIFICAÇÃO: AO VIVO",
-                            username
-                        )
+                is_live = dados.get(
+                    "is_live"
+                )
 
-                        return True
+                if is_live is True:
 
-                    if is_live is False:
+                    logger.info(
+                        "[%s] VERIFICAÇÃO: AO VIVO",
+                        username
+                    )
 
-                        logger.info(
-                            "[%s] VERIFICAÇÃO: OFFLINE",
-                            username
-                        )
+                    return True
 
-                        return False
+                if is_live is False:
+
+                    logger.info(
+                        "[%s] VERIFICAÇÃO: OFFLINE "
+                        "(is_live=False)",
+                        username
+                    )
+
+                    return False
+
+                if live_status in (
+                    "post_live",
+                    "was_live",
+                    "not_live",
+                    "is_upcoming"
+                ):
+
+                    logger.info(
+                        "[%s] VERIFICAÇÃO: OFFLINE "
+                        "(live_status=%s)",
+                        username,
+                        live_status
+                    )
+
+                    return False
 
             except json.JSONDecodeError:
 
                 continue
 
-        if "not currently live" in erro.lower():
+        erro_lower = erro.lower()
 
-            logger.info(
-                "[%s] yt-dlp informou que não está ao vivo.",
+        if "not currently live" in erro_lower:
+
+            logger.warning(
+                "[%s] yt-dlp informou "
+                "'not currently live'.",
                 username
             )
 
+            # IMPORTANTE:
+            # Não tratamos isso como certeza absoluta.
+            # O TikTok/yt-dlp possui histórico desse falso negativo.
             return False
 
-        if processo.returncode == 0:
+        if processo.returncode != 0:
 
-            logger.info(
-                "[%s] yt-dlp retornou sem confirmação.",
-                username
+            logger.warning(
+                "[%s] yt-dlp terminou com código %s "
+                "sem confirmação de LIVE.",
+                username,
+                processo.returncode
             )
 
-        return False
+            return None
+
+        logger.warning(
+            "[%s] yt-dlp retornou sem confirmação.",
+            username
+        )
+
+        return None
 
     except Exception as e:
 
@@ -553,7 +621,83 @@ async def verificar_live(
             e
         )
 
-        return False
+        return None
+
+
+# ============================================================
+# VERIFICAR LIVE - COM RETENTATIVAS
+# ============================================================
+
+async def verificar_live(
+    username: str,
+    tentativas: int = VERIFICATION_RETRIES
+):
+    """
+    Faz várias verificações antes de aceitar
+    uma resposta negativa.
+
+    Retorna:
+
+    True  = confirmou ao vivo
+    False = confirmou offline após tentativas
+    None  = não conseguiu determinar
+    """
+
+    username = normalizar_usuario(
+        username
+    )
+
+    resultado_indefinido = False
+
+    for tentativa in range(
+        1,
+        tentativas + 1
+    ):
+
+        resultado = await verificar_live_once(
+            username
+        )
+
+        if resultado is True:
+
+            return True
+
+        if resultado is None:
+
+            resultado_indefinido = True
+
+        if tentativa < tentativas:
+
+            logger.info(
+                "[%s] Verificação negativa/indefinida "
+                "(%s/%s). Nova tentativa em %ss.",
+                username,
+                tentativa,
+                tentativas,
+                VERIFICATION_RETRY_SECONDS
+            )
+
+            await asyncio.sleep(
+                VERIFICATION_RETRY_SECONDS
+            )
+
+    if resultado_indefinido:
+
+        logger.warning(
+            "[%s] Não foi possível determinar "
+            "com segurança se está ao vivo.",
+            username
+        )
+
+        return None
+
+    logger.warning(
+        "[%s] OFFLINE confirmado após %s tentativas.",
+        username,
+        tentativas
+    )
+
+    return False
 
 
 # ============================================================
@@ -1334,7 +1478,7 @@ async def record_live(
             )
 
             # =================================================
-            # OFFLINE
+            # OFFLINE DO YT-DLP
             # =================================================
 
             erro_offline = (
@@ -1348,18 +1492,78 @@ async def record_live(
                 )
             )
 
+            # =================================================
+            # NÃO ENCERRA IMEDIATAMENTE
+            #
+            # O TikTok/yt-dlp pode informar falsamente
+            # que a LIVE não está ativa.
+            # =================================================
+
             if (
                 erro_offline
+                and not arquivo_gerado
                 and not arquivos_existentes
             ):
 
-                await enviar_mensagem(
-                    chat_id,
-                    f"⚠️ @{username} não está disponível "
-                    f"para gravação no momento."
+                logger.warning(
+                    "[%s] yt-dlp informou offline. "
+                    "Não vamos desistir imediatamente.",
+                    username
                 )
 
-                break
+                confirmou_offline = True
+
+                for tentativa in range(
+                    1,
+                    VERIFICATION_RETRIES + 1
+                ):
+
+                    if username in stop_requests:
+
+                        break
+
+                    resultado = await verificar_live_once(
+                        username
+                    )
+
+                    if resultado is True:
+
+                        confirmou_offline = False
+
+                        logger.info(
+                            "[%s] LIVE confirmada após "
+                            "falso negativo do yt-dlp.",
+                            username
+                        )
+
+                        break
+
+                    if tentativa < VERIFICATION_RETRIES:
+
+                        logger.info(
+                            "[%s] Ainda não confirmou LIVE. "
+                            "Nova tentativa %s/%s em %ss.",
+                            username,
+                            tentativa + 1,
+                            VERIFICATION_RETRIES,
+                            VERIFICATION_RETRY_SECONDS
+                        )
+
+                        await asyncio.sleep(
+                            VERIFICATION_RETRY_SECONDS
+                        )
+
+                if confirmou_offline:
+
+                    await enviar_mensagem(
+                        chat_id,
+                        f"⚠️ Não consegui acessar a LIVE de "
+                        f"@{username} após várias tentativas.\n"
+                        f"🔄 Se ela estiver realmente ao vivo, "
+                        f"tente novamente em alguns segundos."
+                    )
+
+                    break
 
             # =================================================
             # LOG DO ARQUIVO
@@ -1376,7 +1580,7 @@ async def record_live(
             # VERIFICAR LIVE
             # =================================================
 
-            ainda_ativa = False
+            ainda_ativa = None
 
             if username in monitored_users:
 
@@ -1385,16 +1589,37 @@ async def record_live(
                     {}
                 )
 
-                ainda_ativa = info.get(
+                if info.get(
                     "live",
                     False
-                )
+                ):
 
-            if not ainda_ativa:
+                    ainda_ativa = True
+
+            if ainda_ativa is not True:
 
                 ainda_ativa = await verificar_live(
                     username
                 )
+
+            # =================================================
+            # RESULTADO INDEFINIDO
+            # =================================================
+
+            if ainda_ativa is None:
+
+                logger.warning(
+                    "[%s] Não foi possível confirmar "
+                    "se a LIVE terminou. "
+                    "Não encerrando definitivamente.",
+                    username
+                )
+
+                await asyncio.sleep(
+                    RECONNECT_SECONDS
+                )
+
+                continue
 
             # =================================================
             # LIVE TERMINOU
@@ -1402,8 +1627,47 @@ async def record_live(
 
             if not ainda_ativa:
 
+                # Para uma gravação manual, fazemos uma
+                # última confirmação antes de encerrar.
+
+                logger.warning(
+                    "[%s] LIVE aparentemente offline. "
+                    "Fazendo confirmação final.",
+                    username
+                )
+
+                await asyncio.sleep(
+                    VERIFICATION_RETRY_SECONDS
+                )
+
+                confirmacao_final = await verificar_live(
+                    username,
+                    tentativas=2
+                )
+
+                if confirmacao_final is True:
+
+                    logger.info(
+                        "[%s] Era um falso offline. "
+                        "Continuando gravação.",
+                        username
+                    )
+
+                    continue
+
+                if confirmacao_final is None:
+
+                    logger.warning(
+                        "[%s] Não foi possível confirmar "
+                        "o encerramento da LIVE. "
+                        "Continuando.",
+                        username
+                    )
+
+                    continue
+
                 logger.info(
-                    "[%s] Live não está mais confirmada.",
+                    "[%s] Live confirmada como encerrada.",
                     username
                 )
 
@@ -1723,6 +1987,7 @@ async def cmd_monitorar(
         "chat_id": chat_id,
         "live": False,
         "started_at": None,
+        "offline_checks": 0,
     }
 
     # ========================================================
@@ -1788,6 +2053,29 @@ async def monitorar_usuario(
                 username
             )
 
+            info = monitored_users.get(
+                username,
+                {}
+            )
+
+            # =================================================
+            # NÃO FOI POSSÍVEL DETERMINAR
+            # =================================================
+
+            if ao_vivo is None:
+
+                logger.warning(
+                    "[%s] Verificação inconclusiva. "
+                    "Mantendo estado anterior.",
+                    username
+                )
+
+                await asyncio.sleep(
+                    MONITOR_INTERVAL
+                )
+
+                continue
+
             # =================================================
             # ENTROU AO VIVO
             # =================================================
@@ -1799,13 +2087,11 @@ async def monitorar_usuario(
 
                 estava_ao_vivo = True
 
-                monitored_users[
-                    username
-                ]["live"] = True
+                info["offline_checks"] = 0
 
-                monitored_users[
-                    username
-                ]["started_at"] = (
+                info["live"] = True
+
+                info["started_at"] = (
                     datetime.now().isoformat()
                 )
 
@@ -1832,28 +2118,57 @@ async def monitorar_usuario(
 
             elif ao_vivo:
 
-                monitored_users[
-                    username
-                ]["live"] = True
+                estava_ao_vivo = True
+
+                info["offline_checks"] = 0
+
+                info["live"] = True
 
             # =================================================
-            # SAIU DO AR
+            # POSSÍVEL SAÍDA DO AR
             # =================================================
 
-            elif (
-                not ao_vivo
-                and estava_ao_vivo
-            ):
+            else:
+
+                info["offline_checks"] = (
+                    info.get(
+                        "offline_checks",
+                        0
+                    ) + 1
+                )
+
+                contador = info[
+                    "offline_checks"
+                ]
+
+                logger.warning(
+                    "[%s] Offline detectado "
+                    "(%s/%s confirmações).",
+                    username,
+                    contador,
+                    OFFLINE_CONFIRMATIONS
+                )
+
+                # Não considera offline imediatamente.
+                if contador < OFFLINE_CONFIRMATIONS:
+
+                    await asyncio.sleep(
+                        MONITOR_INTERVAL
+                    )
+
+                    continue
+
+                # =================================================
+                # SAIU DO AR CONFIRMADO
+                # =================================================
 
                 estava_ao_vivo = False
 
-                monitored_users[
-                    username
-                ]["live"] = False
+                info["live"] = False
 
-                monitored_users[
-                    username
-                ]["started_at"] = None
+                info["started_at"] = None
+
+                info["offline_checks"] = 0
 
                 await salvar_monitorados()
 
@@ -1863,16 +2178,6 @@ async def monitorar_usuario(
                     f"não está mais sendo detectada "
                     f"como ao vivo."
                 )
-
-            # =================================================
-            # OFFLINE
-            # =================================================
-
-            else:
-
-                monitored_users[
-                    username
-                ]["live"] = False
 
             await asyncio.sleep(
                 MONITOR_INTERVAL
@@ -2200,7 +2505,7 @@ async def shutdown():
     )
 
     # ========================================================
-    # SALVAR MONITORADOS ANTES DO SHUTDOWN
+    # SALVAR MONITORADOS
     # ========================================================
 
     try:
