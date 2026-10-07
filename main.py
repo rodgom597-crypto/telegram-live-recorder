@@ -15,7 +15,7 @@ import uvicorn
 
 
 # ============================================================
-# CONFIGURAÇÃO
+# CONFIGURAÇÕES
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -32,14 +32,14 @@ TENTATIVAS_MANUAL = 3
 TIKTOK_TIMEOUT = 25
 
 redis_client = None
+
 shutting_down = False
 
 http_session = requests.Session()
 
-# Tarefas de monitoramento
 tarefas_monitoramento = {}
 
-# Informações completas das gravações
+# Guarda as gravações que estão acontecendo
 gravacoes_ativas = {}
 
 
@@ -63,21 +63,123 @@ app = FastAPI()
 
 
 # ============================================================
+# TELEGRAM
+# ============================================================
+
+def telegram_url(endpoint):
+    return f"https://api.telegram.org/bot{BOT_TOKEN}/{endpoint}"
+
+
+async def telegram_request(endpoint, payload=None, files=None):
+    url = telegram_url(endpoint)
+
+    def request_sync():
+        try:
+            if files:
+                return http_session.post(
+                    url,
+                    data=payload or {},
+                    files=files,
+                    timeout=180
+                )
+
+            return http_session.post(
+                url,
+                json=payload or {},
+                timeout=60
+            )
+
+        except Exception as e:
+            logger.error(f"Erro Telegram {endpoint}: {e}")
+            return None
+
+    return await asyncio.to_thread(request_sync)
+
+
+async def enviar_mensagem(chat_id, texto):
+    if not chat_id:
+        return
+
+    resposta = await telegram_request(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": texto
+        }
+    )
+
+    if resposta is None:
+        logger.error("Não foi possível enviar mensagem para o Telegram.")
+
+
+async def enviar_video(chat_id, arquivo, legenda=None):
+    if not chat_id:
+        return False
+
+    if not arquivo.exists():
+        logger.error(f"Arquivo não encontrado para envio: {arquivo}")
+        return False
+
+    def upload_sync():
+        try:
+            with open(arquivo, "rb") as video:
+                files = {
+                    "video": (
+                        arquivo.name,
+                        video,
+                        "video/mp4"
+                    )
+                }
+
+                data = {
+                    "chat_id": str(chat_id)
+                }
+
+                if legenda:
+                    data["caption"] = legenda
+
+                resposta = http_session.post(
+                    telegram_url("sendVideo"),
+                    data=data,
+                    files=files,
+                    timeout=600
+                )
+
+                return resposta
+
+        except Exception as e:
+            logger.error(f"Erro ao enviar vídeo: {e}")
+            return None
+
+    resposta = await asyncio.to_thread(upload_sync)
+
+    if resposta is None:
+        return False
+
+    if resposta.ok:
+        logger.info(f"Vídeo enviado para o chat {chat_id}.")
+        return True
+
+    logger.error(
+        f"Erro ao enviar vídeo. "
+        f"HTTP {resposta.status_code}: {resposta.text[:500]}"
+    )
+
+    return False
+
+
+# ============================================================
 # REDIS
 # ============================================================
 
 async def conectar_redis():
-
     global redis_client
 
     if not REDIS_URL:
-        logger.warning(
-            "⚠️ REDIS_URL não configurada."
-        )
+        logger.warning("REDIS_URL não configurada.")
         return False
 
     try:
-
         redis_client = redis.from_url(
             REDIS_URL,
             decode_responses=True
@@ -85,311 +187,126 @@ async def conectar_redis():
 
         await redis_client.ping()
 
-        logger.info(
-            "✅ Redis conectado."
-        )
+        logger.info("Redis conectado com sucesso.")
 
         return True
 
     except Exception as e:
-
-        logger.error(
-            f"❌ Erro ao conectar Redis: {e}"
-        )
-
+        logger.error(f"Erro ao conectar no Redis: {e}")
         redis_client = None
-
         return False
 
 
 async def salvar_monitorados():
-
     if not redis_client:
         return
 
     try:
+        await redis_client.delete("tiktok_monitorados")
 
-        contas = list(
-            tarefas_monitoramento.keys()
-        )
+        if not tarefas_monitoramento:
+            return
 
-        await redis_client.delete(
-            "monitorados"
-        )
+        for usuario, dados in tarefas_monitoramento.items():
 
-        if contas:
+            chat_id = dados.get("chat_id")
 
-            await redis_client.sadd(
-                "monitorados",
-                *contas
+            await redis_client.hset(
+                "tiktok_monitorados",
+                usuario,
+                str(chat_id)
             )
 
         logger.info(
-            f"💾 Monitorados salvos no Redis: {contas}"
+            f"Monitorados salvos no Redis: "
+            f"{list(tarefas_monitoramento.keys())}"
         )
 
     except Exception as e:
-
-        logger.error(
-            f"❌ Erro ao salvar monitorados: {e}"
-        )
+        logger.error(f"Erro ao salvar monitorados: {e}")
 
 
 async def carregar_monitorados():
-
     if not redis_client:
-        return []
+        return {}
 
     try:
-
-        contas = await redis_client.smembers(
-            "monitorados"
+        dados = await redis_client.hgetall(
+            "tiktok_monitorados"
         )
 
-        return list(contas)
+        logger.info(
+            f"Monitorados carregados do Redis: "
+            f"{list(dados.keys())}"
+        )
+
+        return dados
 
     except Exception as e:
-
         logger.error(
-            f"❌ Erro ao carregar monitorados: {e}"
+            f"Erro ao carregar monitorados: {e}"
         )
 
-        return []
+        return {}
 
 
 # ============================================================
-# TELEGRAM
-# ============================================================
-
-async def telegram_request(
-    method,
-    data=None,
-    files=None
-):
-
-    url = (
-        f"https://api.telegram.org/bot"
-        f"{BOT_TOKEN}/{method}"
-    )
-
-    try:
-
-        response = await asyncio.to_thread(
-            requests.post,
-            url,
-            data=data,
-            files=files,
-            timeout=120
-        )
-
-        if not response.ok:
-
-            logger.error(
-                f"❌ Telegram HTTP "
-                f"{response.status_code}: "
-                f"{response.text[:500]}"
-            )
-
-            return None
-
-        return response.json()
-
-    except Exception as e:
-
-        logger.error(
-            f"❌ Erro Telegram {method}: {e}"
-        )
-
-        return None
-
-
-async def enviar_mensagem(
-    chat_id,
-    texto
-):
-
-    return await telegram_request(
-        "sendMessage",
-        data={
-            "chat_id": chat_id,
-            "text": texto
-        }
-    )
-
-
-async def enviar_video(
-    chat_id,
-    arquivo,
-    legenda=None
-):
-
-    if not arquivo.exists():
-
-        logger.error(
-            f"❌ Arquivo não encontrado: {arquivo}"
-        )
-
-        return False
-
-    try:
-
-        with open(
-            arquivo,
-            "rb"
-        ) as video:
-
-            files = {
-                "video": (
-                    arquivo.name,
-                    video,
-                    "video/mp4"
-                )
-            }
-
-            data = {
-                "chat_id": str(chat_id)
-            }
-
-            if legenda:
-
-                data["caption"] = legenda
-
-            resultado = await telegram_request(
-                "sendVideo",
-                data=data,
-                files=files
-            )
-
-        if resultado and resultado.get("ok"):
-
-            logger.info(
-                f"✅ Vídeo enviado: {arquivo.name}"
-            )
-
-            return True
-
-        logger.error(
-            "❌ Telegram não enviou o vídeo."
-        )
-
-        return False
-
-    except Exception as e:
-
-        logger.error(
-            f"❌ Erro enviando vídeo: {e}"
-        )
-
-        return False
-
-
-# ============================================================
-# TIKTOK HEADERS
+# TIKTOK
 # ============================================================
 
 def headers_tiktok():
-
     return {
-
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/140.0.0.0 Safari/537.36"
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
         ),
-
         "Accept": (
             "text/html,application/xhtml+xml,"
             "application/xml;q=0.9,image/avif,"
             "image/webp,*/*;q=0.8"
         ),
-
-        "Accept-Language":
-            "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-
-        "Referer":
-            "https://www.tiktok.com/",
-
-        "Connection":
-            "keep-alive",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.tiktok.com/",
+        "Connection": "keep-alive"
     }
 
 
-# ============================================================
-# ROOM ID
-# ============================================================
-
-async def obter_room_id(usuario):
-
-    usuario = (
-        usuario
-        .strip()
-        .lstrip("@")
-    )
-
-    url = (
-        f"https://www.tiktok.com/"
-        f"@{usuario}/live"
-    )
-
-    logger.info(
-        f"[{usuario}] Consultando página LIVE..."
-    )
+def obter_room_id(usuario):
+    url = f"https://www.tiktok.com/@{usuario}/live"
 
     try:
-
-        resposta = await asyncio.to_thread(
-            http_session.get,
+        resposta = http_session.get(
             url,
             headers=headers_tiktok(),
-            timeout=TIKTOK_TIMEOUT,
-            allow_redirects=True
-        )
-
-        logger.info(
-            f"[{usuario}] TikTok HTTP "
-            f"{resposta.status_code}"
+            timeout=TIKTOK_TIMEOUT
         )
 
         if resposta.status_code != 200:
-
-            logger.warning(
-                f"[{usuario}] Página LIVE retornou "
+            logger.info(
+                f"[{usuario}] TikTok retornou "
                 f"HTTP {resposta.status_code}"
             )
 
             return None
 
-        html = resposta.text
+        texto = resposta.text
 
         padroes = [
-
-            r'"roomId"\s*:\s*"(\d+)"',
-
-            r'"room_id"\s*:\s*"(\d+)"',
-
-            r'"roomId"\s*:\s*(\d+)',
-
-            r'"room_id"\s*:\s*(\d+)',
-
-            r'roomId\\":\\"(\d+)',
-
-            r'room_id\\":\\"(\d+)',
-
-            r'roomId%22%3A%22(\d+)',
-
-            r'room_id%22%3A%22(\d+)',
+            r'"roomId":"(\d+)"',
+            r'"room_id":"(\d+)"',
+            r'"roomId":(\d+)',
+            r'"room_id":(\d+)'
         ]
 
         for padrao in padroes:
-
             encontrado = re.search(
                 padrao,
-                html,
-                re.IGNORECASE
+                texto
             )
 
             if encontrado:
-
                 room_id = encontrado.group(1)
 
                 logger.info(
@@ -399,265 +316,153 @@ async def obter_room_id(usuario):
 
                 return room_id
 
-        logger.warning(
-            f"[{usuario}] Room ID não encontrado."
+        logger.info(
+            f"[{usuario}] Não foi possível encontrar "
+            f"Room ID."
         )
 
         return None
 
     except Exception as e:
-
         logger.error(
-            f"[{usuario}] Erro obtendo Room ID: {e}"
+            f"[{usuario}] Erro ao obter Room ID: {e}"
         )
 
         return None
 
 
-# ============================================================
-# ROOM INFO
-# ============================================================
-
-async def consultar_room_info(
-    room_id,
-    usuario
-):
-
+def consultar_room_info(room_id, usuario):
     url = (
-        "https://webcast.tiktok.com/"
-        "webcast/room/info"
+        "https://webcast.tiktok.com/webcast/room/info"
     )
 
-    parametros = {
+    params = {
         "aid": "1988",
         "room_id": room_id
     }
 
-    headers = headers_tiktok()
-
-    headers.update({
-
-        "Accept":
-            "application/json, text/plain, */*",
-
-        "Origin":
-            "https://www.tiktok.com",
-
-        "Referer":
-            f"https://www.tiktok.com/"
-            f"@{usuario}/live"
-    })
-
-    logger.info(
-        f"[{usuario}] Consultando API room/info..."
-    )
-
     try:
-
-        resposta = await asyncio.to_thread(
-            http_session.get,
+        resposta = http_session.get(
             url,
-            params=parametros,
-            headers=headers,
+            params=params,
+            headers=headers_tiktok(),
             timeout=TIKTOK_TIMEOUT
         )
 
         logger.info(
-            f"[{usuario}] API room/info HTTP "
+            f"[{usuario}] Room info HTTP "
             f"{resposta.status_code}"
         )
 
         if resposta.status_code != 200:
-
-            logger.warning(
-                f"[{usuario}] room/info retornou "
-                f"HTTP {resposta.status_code}: "
-                f"{resposta.text[:300]}"
-            )
-
             return None
 
-        try:
-
-            dados = resposta.json()
-
-        except Exception:
-
-            logger.error(
-                f"[{usuario}] Resposta não é JSON."
-            )
-
-            return None
-
-        return dados
+        return resposta.json()
 
     except Exception as e:
-
         logger.error(
-            f"[{usuario}] Erro room/info: {e}"
+            f"[{usuario}] Erro room info: {e}"
         )
 
         return None
 
 
-# ============================================================
-# ENCONTRAR URLS DE STREAM
-# ============================================================
-
 def encontrar_urls_stream(obj):
-
-    encontrados = []
+    urls = []
 
     if isinstance(obj, dict):
 
-        for valor in obj.values():
+        for chave, valor in obj.items():
 
-            encontrados.extend(
-                encontrar_urls_stream(valor)
-            )
+            if isinstance(valor, str):
+
+                valor_lower = valor.lower()
+
+                if (
+                    ".flv" in valor_lower
+                    or ".m3u8" in valor_lower
+                    or "pull-" in valor_lower
+                    or "pull." in valor_lower
+                ):
+                    urls.append(valor)
+
+            elif isinstance(valor, (dict, list)):
+                urls.extend(
+                    encontrar_urls_stream(valor)
+                )
 
     elif isinstance(obj, list):
 
         for item in obj:
-
-            encontrados.extend(
+            urls.extend(
                 encontrar_urls_stream(item)
             )
 
-    elif isinstance(obj, str):
-
-        texto = obj.strip()
-
-        if texto.startswith("http"):
-
-            texto_lower = texto.lower()
-
-            if (
-                ".flv" in texto_lower
-                or ".m3u8" in texto_lower
-                or "pull-" in texto_lower
-                or "pull." in texto_lower
-            ):
-
-                encontrados.append(texto)
-
-    return encontrados
+    return urls
 
 
 def escolher_stream(urls):
-
     if not urls:
         return None
 
-    flv = []
-    hls = []
-    outros = []
-
+    # Primeiro tenta FLV
     for url in urls:
+        if ".flv" in url.lower():
+            return url
 
-        lower = url.lower()
+    # Depois HLS
+    for url in urls:
+        if ".m3u8" in url.lower():
+            return url
 
-        if ".flv" in lower:
-
-            flv.append(url)
-
-        elif ".m3u8" in lower:
-
-            hls.append(url)
-
-        else:
-
-            outros.append(url)
-
-    if flv:
-        return flv[0]
-
-    if hls:
-        return hls[0]
-
-    if outros:
-        return outros[0]
+    # Qualquer pull válido
+    for url in urls:
+        if (
+            "pull-" in url.lower()
+            or "pull." in url.lower()
+        ):
+            return url
 
     return None
 
 
-# ============================================================
-# DESCOBRIR STREAM
-# ============================================================
-
-async def descobrir_stream(usuario):
-
-    usuario = (
-        usuario
-        .strip()
-        .lstrip("@")
-    )
-
-    room_id = await obter_room_id(
-        usuario
-    )
+def descobrir_stream(usuario):
+    room_id = obter_room_id(usuario)
 
     if not room_id:
-
-        logger.info(
-            f"[{usuario}] "
-            f"Não foi possível obter Room ID."
-        )
-
         return None
 
-    dados = await consultar_room_info(
+    dados = consultar_room_info(
         room_id,
         usuario
     )
 
     if not dados:
+        return None
 
+    urls = encontrar_urls_stream(dados)
+
+    # Remove duplicadas preservando ordem
+    urls = list(dict.fromkeys(urls))
+
+    logger.info(
+        f"[{usuario}] Encontradas "
+        f"{len(urls)} URLs de stream."
+    )
+
+    stream = escolher_stream(urls)
+
+    if stream:
         logger.info(
-            f"[{usuario}] "
-            f"Não foi possível obter informações."
+            f"[{usuario}] Stream escolhida: "
+            f"{stream[:180]}"
         )
-
-        return None
-
-    urls = encontrar_urls_stream(
-        dados
-    )
-
-    logger.info(
-        f"[{usuario}] URLs encontradas: "
-        f"{len(urls)}"
-    )
-
-    stream = escolher_stream(
-        urls
-    )
-
-    if not stream:
-
-        logger.warning(
-            f"[{usuario}] "
-            f"Nenhuma URL encontrada."
-        )
-
-        return None
-
-    tipo = (
-        "FLV"
-        if ".flv" in stream.lower()
-        else "HLS"
-    )
-
-    logger.info(
-        f"[{usuario}] Stream encontrada "
-        f"({tipo})."
-    )
 
     return stream
 
 
 # ============================================================
-# GRAVAR COM FFMPEG
+# FFmpeg
 # ============================================================
 
 async def gravar_stream(
@@ -666,17 +471,9 @@ async def gravar_stream(
     arquivo_flv,
     controle
 ):
-
-    logger.info(
-        f"[{usuario}] Iniciando FFmpeg..."
-    )
-
     comando = [
-
         "ffmpeg",
-
         "-hide_banner",
-
         "-loglevel",
         "warning",
 
@@ -702,183 +499,217 @@ async def gravar_stream(
         "flv",
 
         "-y",
-
         str(arquivo_flv)
     ]
+
+    logger.info(
+        f"[{usuario}] Iniciando FFmpeg."
+    )
 
     try:
 
         processo = await asyncio.create_subprocess_exec(
-
             *comando,
-
-            stdout=asyncio.subprocess.PIPE,
-
+            stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE
         )
 
-        # Guardar o processo para /parar
         controle["processo"] = processo
-
-        logger.info(
-            f"[{usuario}] FFmpeg PID: "
-            f"{processo.pid}"
-        )
 
         while True:
 
-            if controle.get(
-                "parar",
-                False
-            ):
-
+            if controle.get("parar"):
                 logger.info(
-                    f"[{usuario}] "
-                    f"Comando /parar recebido."
+                    f"[{usuario}] Solicitação de parada recebida."
                 )
 
-                if processo.returncode is None:
+                try:
+                    processo.terminate()
+                except Exception:
+                    pass
+
+                try:
+                    await asyncio.wait_for(
+                        processo.wait(),
+                        timeout=10
+                    )
+                except asyncio.TimeoutError:
 
                     try:
-
-                        processo.terminate()
-
-                        logger.info(
-                            f"[{usuario}] "
-                            f"FFmpeg terminate enviado."
-                        )
-
-                    except ProcessLookupError:
+                        processo.kill()
+                    except Exception:
                         pass
 
-                    except Exception as e:
-
-                        logger.warning(
-                            f"[{usuario}] "
-                            f"Erro terminate: {e}"
-                        )
+                    try:
+                        await processo.wait()
+                    except Exception:
+                        pass
 
                 break
 
+            if processo.returncode is not None:
+                break
+
             try:
-
                 linha = await asyncio.wait_for(
-
                     processo.stderr.readline(),
-
                     timeout=1.0
                 )
 
+                if linha:
+                    texto = linha.decode(
+                        errors="ignore"
+                    ).strip()
+
+                    if texto:
+                        logger.info(
+                            f"[{usuario}] {texto}"
+                        )
+
             except asyncio.TimeoutError:
-
-                continue
-
-            if not linha:
-                break
-
-            texto = linha.decode(
-                errors="ignore"
-            ).strip()
-
-            if texto:
-
-                logger.info(
-                    f"[{usuario}] FFmpeg: "
-                    f"{texto}"
-                )
-
-        # Esperar o processo terminar
-        try:
-
-            await asyncio.wait_for(
-                processo.wait(),
-                timeout=10
-            )
-
-        except asyncio.TimeoutError:
-
-            logger.warning(
-                f"[{usuario}] "
-                f"FFmpeg não terminou. "
-                f"Forçando encerramento."
-            )
-
-            try:
-                processo.kill()
-            except Exception:
                 pass
-
-            await processo.wait()
 
         codigo = processo.returncode
 
         logger.info(
-            f"[{usuario}] FFmpeg terminou "
-            f"com código {codigo}."
+            f"[{usuario}] FFmpeg finalizado. "
+            f"Código: {codigo}"
         )
 
-        controle["processo"] = None
-
-        return True
-
-    except asyncio.CancelledError:
-
-        processo = controle.get(
-            "processo"
-        )
-
-        if processo:
-
-            try:
-
-                if processo.returncode is None:
-                    processo.terminate()
-
-            except Exception:
-                pass
-
-        raise
+        return codigo
 
     except Exception as e:
 
         logger.error(
-            f"[{usuario}] Erro FFmpeg: {e}"
+            f"[{usuario}] Erro no FFmpeg: {e}"
         )
 
-        controle["processo"] = None
-
-        return False
+        return -1
 
 
 # ============================================================
-# CONVERTER PARA MP4
+# CONVERSÃO RÁPIDA FLV -> MP4
 # ============================================================
 
-async def converter_mp4(
-    usuario,
+async def converter_mp4_rapido(
     arquivo_flv,
     arquivo_mp4
 ):
+    """
+    Primeira tentativa:
+
+    FLV -> MP4 usando -c copy.
+
+    Não reencoda o vídeo.
+    É MUITO mais rápido.
+    """
+
+    comando = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+
+        "-fflags",
+        "+genpts",
+
+        "-i",
+        str(arquivo_flv),
+
+        "-map",
+        "0:v?",
+        "-map",
+        "0:a?",
+
+        "-c",
+        "copy",
+
+        "-movflags",
+        "+faststart",
+
+        "-y",
+        str(arquivo_mp4)
+    ]
 
     logger.info(
-        f"[{usuario}] "
-        f"Convertendo FLV para MP4..."
+        "Tentando conversão rápida "
+        "FLV -> MP4 sem reencodar."
     )
 
-    if not arquivo_flv.exists():
+    try:
 
-        logger.error(
-            f"[{usuario}] FLV não encontrado."
+        processo = await asyncio.create_subprocess_exec(
+            *comando,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        stdout, stderr = await processo.communicate()
+
+        if processo.returncode == 0:
+
+            if arquivo_mp4.exists():
+
+                tamanho = arquivo_mp4.stat().st_size
+
+                if tamanho > 0:
+
+                    logger.info(
+                        "Conversão rápida concluída "
+                        f"com sucesso. "
+                        f"Tamanho: {tamanho / 1024 / 1024:.2f} MB"
+                    )
+
+                    return True
+
+        erro = stderr.decode(
+            errors="ignore"
+        )
+
+        logger.warning(
+            "Conversão rápida falhou:\n"
+            f"{erro[-3000:]}"
+        )
+
+        if arquivo_mp4.exists():
+            try:
+                arquivo_mp4.unlink()
+            except Exception:
+                pass
+
+        return False
+
+    except Exception as e:
+
+        logger.warning(
+            f"Erro na conversão rápida: {e}"
         )
 
         return False
 
+
+# ============================================================
+# CONVERSÃO DE SEGURANÇA
+# ============================================================
+
+async def converter_mp4_reencode(
+    arquivo_flv,
+    arquivo_mp4
+):
+    """
+    Fallback.
+
+    Só será usado se a conversão rápida
+    não funcionar.
+
+    Aqui o vídeo é reencodado para garantir
+    compatibilidade e tentar corrigir problemas
+    de frames.
+    """
+
     comando = [
-
         "ffmpeg",
-
         "-hide_banner",
-
         "-loglevel",
         "warning",
 
@@ -893,7 +724,6 @@ async def converter_mp4(
 
         "-map",
         "0:v?",
-
         "-map",
         "0:a?",
 
@@ -919,265 +749,247 @@ async def converter_mp4(
         "+faststart",
 
         "-y",
-
         str(arquivo_mp4)
     ]
+
+    logger.info(
+        "Usando conversão de segurança "
+        "com reencode."
+    )
 
     try:
 
         processo = await asyncio.create_subprocess_exec(
-
             *comando,
-
             stdout=asyncio.subprocess.PIPE,
-
             stderr=asyncio.subprocess.PIPE
         )
 
         stdout, stderr = await processo.communicate()
 
-        if processo.returncode != 0:
+        if processo.returncode == 0:
 
-            erro = stderr.decode(
-                errors="ignore"
-            )
+            if arquivo_mp4.exists():
 
-            logger.error(
-                f"[{usuario}] "
-                f"Erro conversão:\n"
-                f"{erro[-3000:]}"
-            )
+                tamanho = arquivo_mp4.stat().st_size
 
-            return False
+                if tamanho > 0:
 
-        if not arquivo_mp4.exists():
+                    logger.info(
+                        "Conversão de segurança "
+                        "concluída com sucesso."
+                    )
 
-            logger.error(
-                f"[{usuario}] "
-                f"MP4 não foi criado."
-            )
+                    return True
 
-            return False
-
-        tamanho = arquivo_mp4.stat().st_size
-
-        logger.info(
-            f"[{usuario}] MP4 criado: "
-            f"{tamanho / 1024 / 1024:.2f} MB"
+        erro = stderr.decode(
+            errors="ignore"
         )
 
-        return True
+        logger.error(
+            "Falha no reencode:\n"
+            f"{erro[-5000:]}"
+        )
+
+        return False
 
     except Exception as e:
 
         logger.error(
-            f"[{usuario}] "
-            f"Erro convertendo MP4: {e}"
+            f"Erro no reencode: {e}"
         )
 
         return False
 
 
+async def converter_para_mp4(
+    arquivo_flv,
+    arquivo_mp4
+):
+    """
+    Sistema inteligente:
+
+    1. Tenta copy = MUITO rápido
+    2. Se falhar = reencode
+    """
+
+    sucesso = await converter_mp4_rapido(
+        arquivo_flv,
+        arquivo_mp4
+    )
+
+    if sucesso:
+        return True
+
+    logger.warning(
+        "Conversão rápida não funcionou. "
+        "Iniciando fallback."
+    )
+
+    return await converter_mp4_reencode(
+        arquivo_flv,
+        arquivo_mp4
+    )
+
+
 # ============================================================
-# PROCESSAR GRAVAÇÃO
+# FINALIZAÇÃO
 # ============================================================
 
 async def finalizar_gravacao(
     usuario,
     chat_id,
-    controle
+    arquivo_flv
 ):
+    if not arquivo_flv.exists():
 
-    arquivo_flv = controle[
-        "arquivo_flv"
-    ]
-
-    arquivo_mp4 = controle[
-        "arquivo_mp4"
-    ]
-
-    parada_manual = controle.get(
-        "parar",
-        False
-    )
-
-    try:
-
-        if not arquivo_flv.exists():
-
-            await enviar_mensagem(
-                chat_id,
-                f"❌ Não foi gerado arquivo "
-                f"para @{usuario}."
-            )
-
-            return
-
-        tamanho = arquivo_flv.stat().st_size
-
-        logger.info(
-            f"[{usuario}] "
-            f"FLV final: "
-            f"{tamanho / 1024 / 1024:.2f} MB"
-        )
-
-        if tamanho < 100_000:
-
-            await enviar_mensagem(
-                chat_id,
-                f"⚠️ A gravação de @{usuario} "
-                f"ficou muito pequena."
-            )
-
-            return
-
-        if parada_manual:
-
-            await enviar_mensagem(
-                chat_id,
-                f"⏹️ Gravação de @{usuario} "
-                f"parada manualmente.\n"
-                f"Convertendo o trecho gravado para MP4..."
-            )
-
-        else:
-
-            await enviar_mensagem(
-                chat_id,
-                f"⏹️ Live de @{usuario} encerrada.\n"
-                f"Convertendo para MP4..."
-            )
-
-        convertido = await converter_mp4(
-            usuario,
-            arquivo_flv,
-            arquivo_mp4
-        )
-
-        if not convertido:
-
-            await enviar_mensagem(
-                chat_id,
-                f"❌ Não consegui converter "
-                f"a gravação de @{usuario}."
-            )
-
-            return
-
-        legenda = (
-            f"🎥 Gravação de @{usuario}\n"
-            f"Formato: MP4"
-        )
-
-        if parada_manual:
-
-            legenda += (
-                "\n⏹️ Gravação encerrada "
-                "manualmente."
-            )
-
-        await enviar_video(
-            chat_id,
-            arquivo_mp4,
-            legenda=legenda
-        )
-
-    except Exception as e:
-
-        logger.exception(
-            f"[{usuario}] "
-            f"Erro finalizando gravação: {e}"
+        logger.warning(
+            f"[{usuario}] Arquivo FLV não encontrado."
         )
 
         await enviar_mensagem(
             chat_id,
-            f"❌ Erro ao finalizar "
-            f"@{usuario}:\n{e}"
+            f"⚠️ A gravação de @{usuario} terminou, "
+            f"mas o arquivo não foi encontrado."
         )
 
-    finally:
+        return
+
+    tamanho_flv = arquivo_flv.stat().st_size
+
+    logger.info(
+        f"[{usuario}] FLV finalizado: "
+        f"{tamanho_flv / 1024 / 1024:.2f} MB"
+    )
+
+    await enviar_mensagem(
+        chat_id,
+        f"⏳ Finalizei a gravação de @{usuario}.\n"
+        f"Convertendo para MP4..."
+    )
+
+    arquivo_mp4 = arquivo_flv.with_suffix(".mp4")
+
+    inicio = asyncio.get_running_loop().time()
+
+    sucesso = await converter_para_mp4(
+        arquivo_flv,
+        arquivo_mp4
+    )
+
+    tempo = (
+        asyncio.get_running_loop().time()
+        - inicio
+    )
+
+    if not sucesso:
+
+        await enviar_mensagem(
+            chat_id,
+            f"❌ Não consegui converter "
+            f"a gravação de @{usuario} para MP4."
+        )
 
         try:
-
-            if arquivo_flv.exists():
-                arquivo_flv.unlink()
-
+            arquivo_flv.unlink()
         except Exception:
             pass
 
-        try:
+        return
 
-            if arquivo_mp4.exists():
-                arquivo_mp4.unlink()
+    tamanho_mp4 = arquivo_mp4.stat().st_size
 
-        except Exception:
-            pass
+    logger.info(
+        f"[{usuario}] MP4 pronto em "
+        f"{tempo:.1f} segundos. "
+        f"Tamanho: {tamanho_mp4 / 1024 / 1024:.2f} MB"
+    )
+
+    await enviar_mensagem(
+        chat_id,
+        f"✅ MP4 pronto!\n"
+        f"⏱️ Conversão: {tempo:.1f}s\n"
+        f"📦 Tamanho: "
+        f"{tamanho_mp4 / 1024 / 1024:.2f} MB\n"
+        f"📤 Enviando para o Telegram..."
+    )
+
+    enviado = await enviar_video(
+        chat_id,
+        arquivo_mp4,
+        f"🎥 Gravação @{usuario}"
+    )
+
+    if enviado:
+
+        await enviar_mensagem(
+            chat_id,
+            f"✅ Gravação de @{usuario} enviada!"
+        )
+
+    else:
+
+        await enviar_mensagem(
+            chat_id,
+            f"⚠️ O MP4 foi criado, "
+            f"mas não consegui enviá-lo ao Telegram."
+        )
+
+    # Limpeza
+    try:
+        if arquivo_flv.exists():
+            arquivo_flv.unlink()
+    except Exception:
+        pass
+
+    try:
+        if arquivo_mp4.exists():
+            arquivo_mp4.unlink()
+    except Exception:
+        pass
 
 
 # ============================================================
-# GRAVAÇÃO PRINCIPAL
+# GRAVAÇÃO COMPLETA
 # ============================================================
 
 async def gravar_live(
     usuario,
     chat_id
 ):
-
-    usuario = (
-        usuario
-        .strip()
-        .lstrip("@")
-    )
+    usuario = usuario.strip().lstrip("@").lower()
 
     if usuario in gravacoes_ativas:
 
-        logger.warning(
-            f"[{usuario}] "
-            f"Já existe uma gravação."
+        await enviar_mensagem(
+            chat_id,
+            f"⚠️ @{usuario} já está sendo gravado."
         )
 
         return
 
-    nome_base = (
-        f"{usuario}_"
-        f"{int(asyncio.get_running_loop().time())}"
+    timestamp = int(
+        asyncio.get_running_loop().time() * 1000
     )
 
     arquivo_flv = (
-        BASE_DIR /
-        f"{nome_base}.flv"
-    )
-
-    arquivo_mp4 = (
-        BASE_DIR /
-        f"{nome_base}.mp4"
+        BASE_DIR
+        / f"{usuario}_{timestamp}.flv"
     )
 
     controle = {
-
-        "usuario": usuario,
-
-        "chat_id": chat_id,
-
-        "processo": None,
-
         "parar": False,
-
-        "arquivo_flv": arquivo_flv,
-
-        "arquivo_mp4": arquivo_mp4
+        "processo": None,
+        "chat_id": chat_id
     }
 
-    gravacoes_ativas[
-        usuario
-    ] = controle
+    gravacoes_ativas[usuario] = controle
 
     try:
 
         await enviar_mensagem(
             chat_id,
-            f"🎥 Iniciando gravação "
-            f"de @{usuario}."
+            f"🔎 Procurando a LIVE de @{usuario}..."
         )
 
         stream_url = None
@@ -1188,24 +1000,21 @@ async def gravar_live(
         ):
 
             if controle["parar"]:
-
                 return
 
-            logger.info(
-                f"[{usuario}] "
-                f"Tentativa "
-                f"{tentativa}/"
-                f"{TENTATIVAS_MANUAL}"
-            )
-
-            stream_url = (
-                await descobrir_stream(
-                    usuario
-                )
+            stream_url = await asyncio.to_thread(
+                descobrir_stream,
+                usuario
             )
 
             if stream_url:
                 break
+
+            logger.info(
+                f"[{usuario}] Stream não encontrada. "
+                f"Tentativa {tentativa}/"
+                f"{TENTATIVAS_MANUAL}"
+            )
 
             if tentativa < TENTATIVAS_MANUAL:
 
@@ -1216,86 +1025,82 @@ async def gravar_live(
             await enviar_mensagem(
                 chat_id,
                 f"❌ Não consegui encontrar "
-                f"a stream de @{usuario}."
+                f"a transmissão de @{usuario}."
             )
-
-            return
-
-        if controle["parar"]:
 
             return
 
         await enviar_mensagem(
             chat_id,
-            f"🔴 Stream encontrada de "
-            f"@{usuario}.\n"
-            f"Gravação iniciada."
+            f"🔴 LIVE encontrada!\n"
+            f"🎥 Iniciando gravação de @{usuario}..."
         )
 
-        await gravar_stream(
+        logger.info(
+            f"[{usuario}] Iniciando gravação."
+        )
+
+        codigo = await gravar_stream(
             usuario,
             stream_url,
             arquivo_flv,
             controle
         )
 
-        await finalizar_gravacao(
-            usuario,
-            chat_id,
-            controle
-        )
-
-    except asyncio.CancelledError:
-
         logger.info(
-            f"[{usuario}] "
-            f"Tarefa cancelada."
+            f"[{usuario}] Gravação encerrada."
         )
 
-        processo = controle.get(
-            "processo"
-        )
+        if arquivo_flv.exists():
 
-        if processo:
+            tamanho = arquivo_flv.stat().st_size
 
-            try:
+            logger.info(
+                f"[{usuario}] Arquivo gravado: "
+                f"{tamanho / 1024 / 1024:.2f} MB"
+            )
 
-                if processo.returncode is None:
-                    processo.terminate()
+            if tamanho > 0:
 
-            except Exception:
-                pass
+                await finalizar_gravacao(
+                    usuario,
+                    chat_id,
+                    arquivo_flv
+                )
 
-        raise
+            else:
+
+                await enviar_mensagem(
+                    chat_id,
+                    f"⚠️ A gravação de @{usuario} "
+                    f"gerou um arquivo vazio."
+                )
+
+        else:
+
+            await enviar_mensagem(
+                chat_id,
+                f"⚠️ Nenhum arquivo foi gerado "
+                f"para @{usuario}."
+            )
 
     except Exception as e:
 
         logger.exception(
-            f"[{usuario}] "
-            f"Erro na gravação: {e}"
+            f"[{usuario}] Erro na gravação."
         )
 
-        try:
-
-            await enviar_mensagem(
-                chat_id,
-                f"❌ Erro na gravação "
-                f"de @{usuario}:\n{e}"
-            )
-
-        except Exception:
-            pass
+        await enviar_mensagem(
+            chat_id,
+            f"❌ Erro na gravação de @{usuario}:\n"
+            f"{str(e)[:500]}"
+        )
 
     finally:
 
         gravacoes_ativas.pop(
             usuario,
             None
-        )
-
-        logger.info(
-            f"[{usuario}] "
-            f"Gravação finalizada."
         )
 
 
@@ -1307,12 +1112,7 @@ async def parar_gravacao(
     usuario,
     chat_id
 ):
-
-    usuario = (
-        usuario
-        .strip()
-        .lstrip("@")
-    )
+    usuario = usuario.strip().lstrip("@").lower()
 
     controle = gravacoes_ativas.get(
         usuario
@@ -1322,15 +1122,14 @@ async def parar_gravacao(
 
         await enviar_mensagem(
             chat_id,
-            f"⚠️ Não encontrei "
-            f"uma gravação ativa de @{usuario}."
+            f"⚠️ Não existe gravação ativa de "
+            f"@{usuario}."
         )
 
         return
 
     logger.info(
-        f"[{usuario}] "
-        f"🛑 PARAR solicitado."
+        f"[{usuario}] Solicitação de parada."
     )
 
     controle["parar"] = True
@@ -1342,61 +1141,42 @@ async def parar_gravacao(
     if processo:
 
         try:
+            processo.terminate()
 
-            if processo.returncode is None:
-
-                logger.info(
-                    f"[{usuario}] "
-                    f"Encerrando FFmpeg PID "
-                    f"{processo.pid}..."
-                )
-
-                processo.terminate()
-
-        except ProcessLookupError:
-            pass
+            await enviar_mensagem(
+                chat_id,
+                f"⏹️ Parando gravação de @{usuario}..."
+            )
 
         except Exception as e:
 
-            logger.error(
-                f"[{usuario}] "
-                f"Erro encerrando FFmpeg: {e}"
+            logger.warning(
+                f"[{usuario}] Erro ao parar FFmpeg: {e}"
             )
 
     else:
 
-        logger.info(
-            f"[{usuario}] "
-            f"FFmpeg ainda não estava iniciado."
+        await enviar_mensagem(
+            chat_id,
+            f"⏹️ Cancelando gravação de @{usuario}..."
         )
-
-    await enviar_mensagem(
-        chat_id,
-        f"⏹️ Parando gravação de @{usuario}..."
-    )
 
 
 # ============================================================
 # MONITORAMENTO
 # ============================================================
 
-async def monitorar_conta(
+async def monitorar_usuario(
     usuario,
     chat_id
 ):
-
-    usuario = (
-        usuario
-        .strip()
-        .lstrip("@")
-    )
+    usuario = usuario.strip().lstrip("@").lower()
 
     logger.info(
-        f"[{usuario}] "
-        f"Monitoramento iniciado."
+        f"[{usuario}] Monitoramento iniciado."
     )
 
-    ao_vivo_anteriormente = False
+    estava_online = False
 
     while not shutting_down:
 
@@ -1404,33 +1184,28 @@ async def monitorar_conta(
 
             if usuario in gravacoes_ativas:
 
+                estava_online = True
+
                 await asyncio.sleep(
                     INTERVALO_MONITORAMENTO
                 )
 
                 continue
 
-            stream_url = (
-                await descobrir_stream(
-                    usuario
-                )
+            stream_url = await asyncio.to_thread(
+                descobrir_stream,
+                usuario
             )
 
-            esta_ao_vivo = (
-                stream_url is not None
-            )
+            online = bool(stream_url)
 
-            if (
-                esta_ao_vivo
-                and not ao_vivo_anteriormente
-            ):
+            if online and not estava_online:
 
                 logger.info(
-                    f"[{usuario}] "
-                    f"🔴 LIVE DETECTADA!"
+                    f"[{usuario}] LIVE detectada."
                 )
 
-                ao_vivo_anteriormente = True
+                estava_online = True
 
                 asyncio.create_task(
                     gravar_live(
@@ -1439,95 +1214,46 @@ async def monitorar_conta(
                     )
                 )
 
-            elif not esta_ao_vivo:
+            elif not online:
 
-                if ao_vivo_anteriormente:
+                if estava_online:
 
                     logger.info(
-                        f"[{usuario}] "
-                        f"LIVE aparentemente encerrada."
+                        f"[{usuario}] LIVE encerrada."
                     )
 
-                ao_vivo_anteriormente = False
-
-            await asyncio.sleep(
-                INTERVALO_MONITORAMENTO
-            )
+                estava_online = False
 
         except asyncio.CancelledError:
-
-            logger.info(
-                f"[{usuario}] "
-                f"Monitoramento cancelado."
-            )
 
             break
 
         except Exception as e:
 
             logger.error(
-                f"[{usuario}] "
-                f"Erro monitoramento: {e}"
+                f"[{usuario}] Erro monitoramento: {e}"
             )
 
-            await asyncio.sleep(
-                INTERVALO_MONITORAMENTO
-            )
+        await asyncio.sleep(
+            INTERVALO_MONITORAMENTO
+        )
 
     logger.info(
-        f"[{usuario}] "
-        f"Monitoramento finalizado."
+        f"[{usuario}] Monitoramento encerrado."
     )
 
-
-# ============================================================
-# RESTAURAR MONITORES
-# ============================================================
 
 async def iniciar_monitores_salvos():
 
-    contas = await carregar_monitorados()
+    dados = await carregar_monitorados()
 
-    if not contas:
-
-        logger.info(
-            "📋 Nenhuma conta monitorada salva."
-        )
-
-        return
-
-    logger.info(
-        f"📋 Contas salvas: {contas}"
-    )
-
-    chat_id = None
-
-    if redis_client:
-
-        try:
-
-            chat_id = await redis_client.get(
-                "monitor_chat_id"
-            )
-
-        except Exception:
-            pass
-
-    if not chat_id:
-
-        logger.warning(
-            "⚠️ monitor_chat_id não encontrado."
-        )
-
-        return
-
-    for usuario in contas:
+    for usuario, chat_id in dados.items():
 
         if usuario in tarefas_monitoramento:
             continue
 
         tarefa = asyncio.create_task(
-            monitorar_conta(
+            monitorar_usuario(
                 usuario,
                 int(chat_id)
             )
@@ -1535,23 +1261,24 @@ async def iniciar_monitores_salvos():
 
         tarefas_monitoramento[
             usuario
-        ] = tarefa
+        ] = {
+            "task": tarefa,
+            "chat_id": int(chat_id)
+        }
 
         logger.info(
-            f"♻️ Monitor restaurado: "
-            f"@{usuario}"
+            f"[{usuario}] Monitor restaurado."
         )
 
 
 # ============================================================
-# COMANDOS TELEGRAM
+# COMANDOS
 # ============================================================
 
 async def processar_comando(
     chat_id,
     texto
 ):
-
     texto = texto.strip()
 
     if not texto:
@@ -1561,8 +1288,7 @@ async def processar_comando(
 
     comando = partes[0].lower()
 
-    if "@" in comando:
-
+    if comando.startswith("/"):
         comando = comando.split("@")[0]
 
     # --------------------------------------------------------
@@ -1572,11 +1298,9 @@ async def processar_comando(
     if comando == "/start":
 
         await enviar_mensagem(
-
             chat_id,
-
-            "🤖 Bot de gravação TikTok LIVE ativo.\n\n"
-
+            "🤖 Bot de gravação TikTok LIVE\n\n"
+            "Comandos disponíveis:\n\n"
             "/gravar usuario\n"
             "/parar usuario\n"
             "/monitorar usuario\n"
@@ -1596,31 +1320,27 @@ async def processar_comando(
 
             await enviar_mensagem(
                 chat_id,
-                "Use:\n/gravar usuario"
+                "Use:\n"
+                "/gravar usuario"
             )
 
             return
 
-        usuario = (
-            partes[1]
-            .strip()
-            .lstrip("@")
-        )
+        usuario = partes[1].lstrip("@")
 
-        if usuario in gravacoes_ativas:
+        if usuario.lower() in gravacoes_ativas:
 
             await enviar_mensagem(
                 chat_id,
-                f"⚠️ @{usuario} "
-                f"já está sendo gravado."
+                f"⚠️ @{usuario} já está sendo gravado."
             )
 
             return
 
         await enviar_mensagem(
             chat_id,
-            f"📨 Solicitação de gravação "
-            f"enviada para @{usuario}."
+            f"📥 Solicitação de gravação enviada "
+            f"para @{usuario}."
         )
 
         asyncio.create_task(
@@ -1642,16 +1362,13 @@ async def processar_comando(
 
             await enviar_mensagem(
                 chat_id,
-                "Use:\n/parar usuario"
+                "Use:\n"
+                "/parar usuario"
             )
 
             return
 
-        usuario = (
-            partes[1]
-            .strip()
-            .lstrip("@")
-        )
+        usuario = partes[1].lstrip("@")
 
         await parar_gravacao(
             usuario,
@@ -1670,29 +1387,25 @@ async def processar_comando(
 
             await enviar_mensagem(
                 chat_id,
-                "Use:\n/monitorar usuario"
+                "Use:\n"
+                "/monitorar usuario"
             )
 
             return
 
-        usuario = (
-            partes[1]
-            .strip()
-            .lstrip("@")
-        )
+        usuario = partes[1].lstrip("@").lower()
 
         if usuario in tarefas_monitoramento:
 
             await enviar_mensagem(
                 chat_id,
-                f"⚠️ @{usuario} "
-                f"já está sendo monitorado."
+                f"⚠️ @{usuario} já está sendo monitorado."
             )
 
             return
 
         tarefa = asyncio.create_task(
-            monitorar_conta(
+            monitorar_usuario(
                 usuario,
                 chat_id
             )
@@ -1700,38 +1413,16 @@ async def processar_comando(
 
         tarefas_monitoramento[
             usuario
-        ] = tarefa
+        ] = {
+            "task": tarefa,
+            "chat_id": chat_id
+        }
 
-        if redis_client:
-
-            try:
-
-                await redis_client.sadd(
-                    "monitorados",
-                    usuario
-                )
-
-                await redis_client.set(
-                    "monitor_chat_id",
-                    str(chat_id)
-                )
-
-            except Exception as e:
-
-                logger.error(
-                    f"Erro salvando monitor: {e}"
-                )
+        await salvar_monitorados()
 
         await enviar_mensagem(
-
             chat_id,
-
-            f"✅ @{usuario} "
-            f"agora está sendo monitorado.\n\n"
-
-            f"Quando entrar ao vivo, "
-            f"a gravação será iniciada "
-            f"automaticamente."
+            f"👁️ @{usuario} agora está sendo monitorado."
         )
 
         return
@@ -1746,56 +1437,39 @@ async def processar_comando(
 
             await enviar_mensagem(
                 chat_id,
-                "Use:\n/desmonitorar usuario"
+                "Use:\n"
+                "/desmonitorar usuario"
             )
 
             return
 
-        usuario = (
-            partes[1]
-            .strip()
-            .lstrip("@")
+        usuario = partes[1].lstrip("@").lower()
+
+        dados = tarefas_monitoramento.pop(
+            usuario,
+            None
         )
 
-        tarefa = (
-            tarefas_monitoramento.pop(
-                usuario,
-                None
+        if not dados:
+
+            await enviar_mensagem(
+                chat_id,
+                f"⚠️ @{usuario} não está sendo monitorado."
             )
-        )
 
-        if tarefa:
+            return
 
-            tarefa.cancel()
+        task = dados.get("task")
 
-            try:
+        if task:
 
-                await tarefa
+            task.cancel()
 
-            except asyncio.CancelledError:
-                pass
-
-        if redis_client:
-
-            try:
-
-                await redis_client.srem(
-                    "monitorados",
-                    usuario
-                )
-
-            except Exception as e:
-
-                logger.error(
-                    f"Erro removendo monitor: {e}"
-                )
+        await salvar_monitorados()
 
         await enviar_mensagem(
-
             chat_id,
-
-            f"🛑 @{usuario} "
-            f"removido do monitoramento."
+            f"🛑 @{usuario} foi removido do monitoramento."
         )
 
         return
@@ -1806,49 +1480,38 @@ async def processar_comando(
 
     if comando == "/monitorados":
 
-        contas = list(
-            tarefas_monitoramento.keys()
-        )
-
-        if not contas:
+        if not tarefas_monitoramento:
 
             await enviar_mensagem(
                 chat_id,
-                "📋 Nenhuma conta "
-                "está sendo monitorada."
+                "📋 Nenhum usuário monitorado."
             )
 
             return
 
-        lista = "\n".join(
-            f"• @{conta}"
-            for conta in sorted(contas)
-        )
+        linhas = [
+            "📋 Usuários monitorados:"
+        ]
 
-        gravando = list(
-            gravacoes_ativas.keys()
-        )
+        for usuario in sorted(
+            tarefas_monitoramento.keys()
+        ):
 
-        texto_resposta = (
-            f"📋 Contas monitoradas:\n\n"
-            f"{lista}"
-        )
+            if usuario in gravacoes_ativas:
 
-        if gravando:
+                linhas.append(
+                    f"🔴 @{usuario} — GRAVANDO"
+                )
 
-            lista_gravando = "\n".join(
-                f"🔴 @{conta}"
-                for conta in gravando
-            )
+            else:
 
-            texto_resposta += (
-                "\n\n🎥 Gravando agora:\n"
-                f"{lista_gravando}"
-            )
+                linhas.append(
+                    f"🟢 @{usuario} — monitorando"
+                )
 
         await enviar_mensagem(
             chat_id,
-            texto_resposta
+            "\n".join(linhas)
         )
 
         return
@@ -1858,36 +1521,28 @@ async def processar_comando(
     # --------------------------------------------------------
 
     await enviar_mensagem(
-
         chat_id,
-
         "❓ Comando não reconhecido.\n\n"
         "Use /start para ver os comandos."
     )
 
 
 # ============================================================
-# WEBHOOK
+# WEBHOOK TELEGRAM
 # ============================================================
 
-async def receber_webhook(
-    request: Request
-):
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
 
     try:
 
         update = await request.json()
-
-        logger.info(
-            "📩 Update Telegram recebido."
-        )
 
         mensagem = update.get(
             "message"
         )
 
         if not mensagem:
-
             return JSONResponse(
                 {"ok": True}
             )
@@ -1897,7 +1552,6 @@ async def receber_webhook(
         )
 
         if not chat:
-
             return JSONResponse(
                 {"ok": True}
             )
@@ -1912,7 +1566,6 @@ async def receber_webhook(
         )
 
         if texto:
-
             asyncio.create_task(
                 processar_comando(
                     chat_id,
@@ -1926,148 +1579,124 @@ async def receber_webhook(
 
     except Exception as e:
 
-        logger.error(
-            f"❌ Erro webhook: {e}"
+        logger.exception(
+            f"Erro webhook Telegram: {e}"
         )
 
         return JSONResponse(
-            {
-                "ok": False,
-                "error": str(e)
-            },
-            status_code=500
+            {"ok": True}
         )
 
 
-@app.post(
-    "/telegram/webhook"
-)
-async def telegram_webhook(
-    request: Request
-):
-
-    return await receber_webhook(
-        request
-    )
-
-
-@app.post(
-    "/webhook"
-)
+@app.post("/webhook")
 async def webhook_alias(
     request: Request
 ):
-
-    return await receber_webhook(
+    return await telegram_webhook(
         request
     )
 
 
 # ============================================================
-# CONFIGURAR WEBHOOK
-# ============================================================
-
-async def configurar_webhook():
-
-    if not BOT_TOKEN:
-
-        logger.error(
-            "❌ BOT_TOKEN não configurado."
-        )
-
-        return False
-
-    if not WEBHOOK_URL:
-
-        logger.warning(
-            "⚠️ WEBHOOK_URL não configurada."
-        )
-
-        return False
-
-    url = (
-        WEBHOOK_URL.rstrip("/")
-        + "/telegram/webhook"
-    )
-
-    resultado = await telegram_request(
-
-        "setWebhook",
-
-        data={
-            "url": url,
-            "drop_pending_updates": "true"
-        }
-    )
-
-    if resultado and resultado.get(
-        "ok"
-    ):
-
-        logger.info(
-            f"✅ Webhook configurado: {url}"
-        )
-
-        return True
-
-    logger.error(
-        "❌ Não foi possível configurar webhook."
-    )
-
-    return False
-
-
-# ============================================================
-# STATUS
+# HEALTH
 # ============================================================
 
 @app.get("/")
-async def raiz():
+async def root():
 
     return {
-
         "status": "online",
-
-        "version":
-            "DIRECT_STREAM_V3",
-
-        "service":
-            "telegram-tiktok-live-recorder"
+        "service": "TikTok LIVE Recorder",
+        "recordings": list(
+            gravacoes_ativas.keys()
+        ),
+        "monitorados": list(
+            tarefas_monitoramento.keys()
+        )
     }
 
 
 @app.get("/health")
 async def health():
 
+    redis_ok = False
+
+    if redis_client:
+
+        try:
+            await redis_client.ping()
+            redis_ok = True
+
+        except Exception:
+            redis_ok = False
+
     return {
-
         "status": "ok",
-
-        "version":
-            "DIRECT_STREAM_V3",
-
-        "redis":
-            redis_client is not None,
-
-        "monitorados":
-            list(
-                tarefas_monitoramento.keys()
-            ),
-
-        "gravando":
-            list(
-                gravacoes_ativas.keys()
-            )
+        "redis": redis_ok,
+        "gravando": list(
+            gravacoes_ativas.keys()
+        ),
+        "monitorados": list(
+            tarefas_monitoramento.keys()
+        )
     }
+
+
+# ============================================================
+# WEBHOOK CONFIG
+# ============================================================
+
+async def configurar_webhook():
+
+    if not BOT_TOKEN:
+        logger.error(
+            "BOT_TOKEN não configurado."
+        )
+
+        return
+
+    if not WEBHOOK_URL:
+
+        logger.warning(
+            "WEBHOOK_URL não configurada."
+        )
+
+        return
+
+    url = WEBHOOK_URL.rstrip(
+        "/"
+    ) + "/telegram/webhook"
+
+    logger.info(
+        f"Configurando webhook: {url}"
+    )
+
+    resposta = await telegram_request(
+        "setWebhook",
+        {
+            "url": url
+        }
+    )
+
+    if resposta and resposta.ok:
+
+        logger.info(
+            "Webhook Telegram configurado."
+        )
+
+    elif resposta:
+
+        logger.error(
+            f"Erro ao configurar webhook: "
+            f"{resposta.text}"
+        )
 
 
 # ============================================================
 # STARTUP
 # ============================================================
 
-@app.on_event(
-    "startup"
-)
+@app.on_event("startup")
 async def startup_event():
 
     global shutting_down
@@ -2075,7 +1704,7 @@ async def startup_event():
     shutting_down = False
 
     logger.info(
-        "🚀 Iniciando BOT DIRECT_STREAM_V3..."
+        "🚀 Iniciando BOT DIRECT_STREAM_V4..."
     )
 
     await conectar_redis()
@@ -2085,7 +1714,7 @@ async def startup_event():
     await iniciar_monitores_salvos()
 
     logger.info(
-        "✅ BOT DIRECT_STREAM_V3 iniciado."
+        "✅ Sistema iniciado."
     )
 
 
@@ -2093,9 +1722,7 @@ async def startup_event():
 # SHUTDOWN
 # ============================================================
 
-@app.on_event(
-    "shutdown"
-)
+@app.on_event("shutdown")
 async def shutdown_event():
 
     global shutting_down
@@ -2103,28 +1730,22 @@ async def shutdown_event():
     shutting_down = True
 
     logger.info(
-        "🛑 Iniciando desligamento..."
+        "🛑 Encerrando aplicação..."
     )
 
-    # Parar monitoramentos
-    tarefas = list(
-        tarefas_monitoramento.values()
-    )
+    # Para monitoramentos
+    for usuario, dados in list(
+        tarefas_monitoramento.items()
+    ):
 
-    for tarefa in tarefas:
+        task = dados.get("task")
 
-        tarefa.cancel()
-
-    if tarefas:
-
-        await asyncio.gather(
-            *tarefas,
-            return_exceptions=True
-        )
+        if task:
+            task.cancel()
 
     tarefas_monitoramento.clear()
 
-    # Parar gravações
+    # Para gravações ativas
     for usuario, controle in list(
         gravacoes_ativas.items()
     ):
@@ -2138,30 +1759,24 @@ async def shutdown_event():
         if processo:
 
             try:
-
-                if processo.returncode is None:
-                    processo.terminate()
+                processo.terminate()
 
             except Exception:
                 pass
 
     await asyncio.sleep(2)
 
-    gravacoes_ativas.clear()
-
-    await salvar_monitorados()
-
     if redis_client:
 
         try:
-
+            await salvar_monitorados()
             await redis_client.close()
 
         except Exception:
             pass
 
     logger.info(
-        "✅ Aplicação encerrada."
+        "Aplicação encerrada."
     )
 
 
